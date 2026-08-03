@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verace-v1"
+version = "1.0.0"
+description = "A next-generation, multimodal large language model architecture combining spectral state-space attention, holographic associative memory, continuous manifold mixture-of-experts, and adaptive per-token compute depth."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Verace Pvt. Ltd.", email = "krrish@verace.in" }]
+keywords = ["llm", "deep-learning", "pytorch", "transformer", "attention", "mixture-of-experts"]
+classifiers = [
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.24.0",
+    "triton>=2.2.0"
+]
+
+[project.urls]
+Homepage = "https://verace.in"
+Repository = "https://github.com/Verace-Pvt-Ltd/verace-v1"
+License = "https://github.com/Verace-Pvt-Ltd/verace-v1/blob/main/LICENSE"
+LinkedIn = "https://www.linkedin.com/company/verace-ai/"
+
+[tool.setuptools.packages.find]
+where = ["."]
