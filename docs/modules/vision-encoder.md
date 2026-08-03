@@ -18,11 +18,11 @@ A standard patch-based ViT encoder:
    model's `hidden_dim` (`projector_dim`). This reduces the number of visual
    tokens by 4x before they enter the decoder's token sequence, and pads the
    patch grid with zeros first if its height or width is odd.
-4. The projected visual tokens are spliced into the leading positions of the
-   token embedding sequence in `VeraceV1Model.forward` (see
-   [backbone.md](backbone.md)), so images and text share the same
-   downstream decoder stack — there is no separate vision pathway past this
-   point.
+4. The projected visual tokens are fused into the token embedding sequence
+   by `VeraceV1Model._fuse_visual_tokens` (see
+   [backbone.md#_fuse_visual_tokens](backbone.md#_fuse_visual_tokens)) — never
+   by overwriting text — so images and text share the same downstream
+   decoder stack; there is no separate vision pathway past this point.
 
 ## Constructors
 
@@ -60,5 +60,5 @@ flowchart TD
     NORM --> MERGE["2x2 token merge\n(embed_dim -> embed_dim x 4)"]
     MERGE --> PROJ["projector\n-> hidden_dim"]
     PROJ --> VTOK["visual_tokens"]
-    VTOK -->|"overwrite leading positions"| TOKEMB["token_embeds\n(VeraceV1Model.forward)"]
+    VTOK -->|"_fuse_visual_tokens\n(replace placeholder positions,\nor prepend -- never overwrite)"| TOKEMB["token_embeds\n(VeraceV1Model.forward)"]
 ```

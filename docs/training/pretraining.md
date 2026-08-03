@@ -2,7 +2,8 @@
 
 **Module:** `verace_v1/training/pretrain.py`
 **Function:** `train_pretrain_step`
-**Test:** exercised in `tests/test_end2end.py`
+**Test:** exercised in `tests/test_end2end.py`; the image-conditioned path is
+covered by `tests/test_vision_fusion.py`
 
 ## What It Does
 
@@ -41,6 +42,25 @@ train_pretrain_step(
 ) -> (ce_loss: float, mean_depth: float)
 ```
 
+### Images and label alignment
+
+When `batch["image"]` is provided and no `media_placeholder_token_id` is
+configured (or the placeholder isn't present in that batch — see
+[Backbone](../modules/backbone.md#_fuse_visual_tokens)), the model prepends
+visual tokens, so `logits.shape[1]` comes back larger than
+`labels.shape[1]`. `train_pretrain_step` guards against this explicitly:
+
+```python
+if logits.shape[1] != labels.shape[1]:
+    logits = logits[:, -labels.shape[1]:, :]
+```
+
+This keeps only the trailing (text) positions before the
+`shift_logits`/`shift_labels` next-token alignment. Without this guard, the
+shift would silently misalign against the prepended visual positions —
+wrong gradients with no error or shape exception. See
+`tests/test_vision_fusion.py::test_pretrain_step_aligns_logits_when_images_grow_sequence_length`.
+
 ## What This Is Not
 
 This function is a minimal, correct reference for wiring the model, loss,
@@ -78,11 +98,12 @@ ce_loss, mean_depth = train_pretrain_step(model, optimizer, batch)
 ```mermaid
 flowchart TD
     B["batch: input_ids, labels, image?"] --> FWD["VeraceV1Model.forward\n(return_hidden=True)"]
-    FWD --> LOGITS["logits"]
+    FWD --> LOGITS["logits\n(longer than labels if\nimages were prepended)"]
     FWD --> DEPTH["depth_counts"]
     FWD --> HIDDEN["hidden"]
 
-    LOGITS --> SHIFT["shift logits/labels by 1"]
+    LOGITS --> ALIGN["align: keep trailing\nlabels.shape[1] positions"]
+    ALIGN --> SHIFT["shift logits/labels by 1"]
     SHIFT --> CE["cross_entropy -> ce_loss"]
 
     DEPTH --> DL["depth_penalty_weight * mean(depth_counts) -> depth_loss"]

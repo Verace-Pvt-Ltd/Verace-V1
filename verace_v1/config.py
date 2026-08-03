@@ -50,6 +50,10 @@ class VeraceV1Config:
     rms_norm_eps: float = 1e-6
     
     vision_config: Optional[Any] = None
+    media_placeholder_token_id: Optional[int] = None  # if set, visual tokens replace
+    # embeddings only at positions in input_ids equal to this id; must be < vocab_size.
+    # If None, or if the id doesn't appear in a given input_ids batch, visual tokens
+    # are prepended instead -- text is never overwritten either way (see backbone.py).
 
     def __post_init__(self):
         if self.vision_config is None:

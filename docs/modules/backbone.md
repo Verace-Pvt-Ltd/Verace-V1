@@ -41,8 +41,8 @@ Assembles the full model:
 - `embed_tokens` / `lm_head`: tied token embedding and output projection.
 - `vision_encoder`: a `VeraceVisionEncoder` (see
   [vision-encoder.md](vision-encoder.md)); if `images` is passed to
-  `forward`, its output tokens overwrite the leading positions of
-  `token_embeds`.
+  `forward`, its output tokens are fused into `token_embeds` via
+  `_fuse_visual_tokens` (see below) — never by overwriting text.
 - `layers`: `config.num_layers` instances of `VeraceV1Layer`.
 - `acd_engine`: an `AdaptiveCognitiveDepthEngine` (see
   [acd-engine.md](acd-engine.md)) that drives per-token early exit across
@@ -66,6 +66,11 @@ forward(
 # returns (logits, depth_counts) — logits: [batch, seq_len, vocab_size], depth_counts: [batch, seq_len]
 # if return_hidden=True, also returns hidden: [batch, seq_len, hidden_dim] (post-final_norm,
 # pre-lm_head) — the representation LatentEnergyCritic scores in generation and training.
+#
+# NOTE: when images is not None, seq_len in the output can be larger than
+# input_ids.shape[1] -- see _fuse_visual_tokens below. Callers that align
+# labels against logits (e.g. train_pretrain_step) must account for this;
+# see docs/training/pretraining.md.
 ```
 
 When `use_adaptive_depth=False`, every layer runs for every token
@@ -74,6 +79,33 @@ path used to sanity-check ACDE's output against the fixed-depth baseline.
 
 See [overview.md](overview.md) for how this fits into the full forward and
 generation flow.
+
+## `_fuse_visual_tokens`
+
+```python
+_fuse_visual_tokens(
+    token_embeds: Tensor,   # [batch, seq_len, hidden_dim]
+    input_ids: Tensor,      # [batch, seq_len]
+    visual_tokens: Tensor,  # [batch, v_len, hidden_dim]
+) -> Tensor
+```
+
+Fuses vision-encoder output into the text embedding sequence **without ever
+discarding text**. Two modes, chosen automatically:
+
+- **`config.media_placeholder_token_id` is set and appears in `input_ids`:**
+  visual tokens replace embeddings only at those exact positions, per batch
+  item (a mismatched placeholder count in one item doesn't affect another).
+  Sequence length is unchanged.
+- **Otherwise (the default):** visual tokens are prepended. Sequence length
+  grows by `v_len`.
+
+An earlier version of this function unconditionally overwrote
+`token_embeds[:, :v_len]` with visual tokens regardless of what text
+occupied those positions — silently destroying the first `v_len` tokens of
+any prompt whenever an image was passed. See `tests/test_vision_fusion.py`
+for the regression tests covering both fusion modes and the resulting
+`logits`/`labels` alignment in [pretraining](../training/pretraining.md).
 
 ## Diagram
 
@@ -97,8 +129,12 @@ flowchart TD
 flowchart TD
     TOK["input_ids"] --> EMB["embed_tokens"]
     IMG["images (optional)"] --> VIS["VeraceVisionEncoder"]
-    VIS -- "overwrites leading positions" --> EMB
-    EMB --> ACD["AdaptiveCognitiveDepthEngine\n.execute_adaptive_recurrent_loop\n(gathers active tokens per VeraceV1Layer)"]
+    VIS --> FUSE["_fuse_visual_tokens"]
+    EMB --> FUSE
+    FUSE -- "placeholder token present" --> REPLACE["replace only those positions\n(seq_len unchanged)"]
+    FUSE -- "no placeholder configured/found" --> PREPEND["prepend visual tokens\n(seq_len grows by v_len)"]
+    REPLACE --> ACD["AdaptiveCognitiveDepthEngine\n.execute_adaptive_recurrent_loop\n(gathers active tokens per VeraceV1Layer)"]
+    PREPEND --> ACD
     LAYERS[["N x VeraceV1Layer"]] -.-> ACD
     ACD --> FH["final_h, depth_counts"]
     FH --> FN["final_norm"]

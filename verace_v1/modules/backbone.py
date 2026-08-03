@@ -160,9 +160,9 @@ class VeraceV1Model(nn.Module):
         token_embeds = self.embed_tokens(input_ids) # [b, s, d]
 
         if images is not None:
-            visual_tokens = self.vision_encoder(images)
-            v_len = min(visual_tokens.shape[1], s)
-            token_embeds[:, :v_len] = visual_tokens[:, :v_len]
+            visual_tokens = self.vision_encoder(images) # [b, v_len, d]
+            token_embeds = self._fuse_visual_tokens(token_embeds, input_ids, visual_tokens)
+            b, s = token_embeds.shape[0], token_embeds.shape[1]
 
         if use_adaptive_depth:
             # Dynamic layer unrolling per token via Adaptive Cognitive Depth Engine
@@ -186,3 +186,34 @@ class VeraceV1Model(nn.Module):
         if return_hidden:
             return logits, depth_counts, norm_final_h
         return logits, depth_counts
+
+    def _fuse_visual_tokens(
+        self,
+        token_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        visual_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Splices visual_tokens into token_embeds without ever discarding text.
+
+        If config.media_placeholder_token_id is set and appears in input_ids, visual
+        tokens replace embeddings only at those exact positions (per batch item,
+        gathered independently so a mismatched placeholder count in one item doesn't
+        affect another). Otherwise, visual_tokens are prepended -- sequence length
+        grows, but no text position is ever overwritten.
+        """
+        b, v_len, d = visual_tokens.shape
+        placeholder_id = self.config.media_placeholder_token_id
+
+        if placeholder_id is not None:
+            media_mask = (input_ids == placeholder_id) # [b, s]
+            if media_mask.any():
+                fused = token_embeds.clone()
+                for b_idx in range(b):
+                    positions = torch.nonzero(media_mask[b_idx], as_tuple=True)[0]
+                    n = min(positions.numel(), v_len)
+                    if n > 0:
+                        fused[b_idx, positions[:n]] = visual_tokens[b_idx, :n]
+                return fused
+
+        return torch.cat([visual_tokens, token_embeds], dim=1)

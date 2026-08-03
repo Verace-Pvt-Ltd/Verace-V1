@@ -102,3 +102,4 @@ optimizer = UnitaryMuon(model.parameters(), lr=0.01)
 | Field | Default | Meaning |
 | :--- | :--- | :--- |
 | `vision_config` | `None` | If left `None`, `__post_init__` fills in a default vision config (`embed_dim=1152, num_layers=27, num_heads=12, patch_size=14`) consumed by `VeraceVisionEncoder` — see [Vision Encoder](modules/vision-encoder.md) |
+| `media_placeholder_token_id` | `None` | If set to a valid token id (must be `< vocab_size`) that appears in `input_ids`, visual tokens replace embeddings only at those positions, preserving sequence length. If `None` (default), or if the id doesn't appear in a given batch, visual tokens are prepended instead — sequence length grows, but text is never overwritten. See [Backbone](modules/backbone.md#_fuse_visual_tokens) and [Pretraining](training/pretraining.md) for the `logits`/`labels` alignment this implies. |

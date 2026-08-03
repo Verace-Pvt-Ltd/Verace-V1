@@ -14,6 +14,7 @@ module claims to guarantee — not just "it runs without erroring."
 | `tests/test_mcmoe.py` | [M-CMoE](modules/mcmoe.md) | Output shape correctness and absence of `NaN` |
 | `tests/test_acd.py` | [ACD Engine](modules/acd-engine.md) | (1) Batch independence — identical item, different batchmates, max logit diff `< 1e-5`; (2) per-example gathering runs correctly under forced early halting |
 | `tests/test_unitary_muon.py` | [Unitary Muon](optimizer/unitary-muon.md) | SVD-based orthogonalization deviation `< 1e-3` across square, tall, wide, and pathologically-small-singular-value inputs; `step()` runs cleanly on a rectangular parameter |
+| `tests/test_vision_fusion.py` | [Backbone](modules/backbone.md#_fuse_visual_tokens) | Fallback (prepend) path never alters existing text embeddings; placeholder-token path preserves sequence length and touches only placeholder positions; [`train_pretrain_step`](training/pretraining.md) correctly aligns `logits`/`labels` when images grow the sequence |
 | `tests/test_end2end.py` | Full pipeline | Model construction → forward pass → [pretraining step](training/pretraining.md) → [generation](serving/generation.md) → [evaluation](eval/benchmark-runner.md), wired together and asserted at each stage |
 
 ## Why These Invariants, Specifically

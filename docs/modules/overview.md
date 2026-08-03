@@ -51,8 +51,11 @@ flowchart TD
 `VeraceV1Model.forward` (`backbone.py`, documented in [backbone.md](backbone.md)):
 
 1. Token IDs are embedded (`embed_tokens`); if images are provided, visual
-   tokens from `VeraceVisionEncoder` are spliced into the leading positions
-   of the embedding sequence.
+   tokens from `VeraceVisionEncoder` are fused into the embedding sequence —
+   replacing embeddings at explicit placeholder-token positions if
+   `config.media_placeholder_token_id` is set and present, otherwise
+   prepended (never overwriting text) — see
+   [backbone.md#_fuse_visual_tokens](backbone.md#_fuse_visual_tokens).
 2. The embeddings are run through `VeraceV1Layer` instances. Each layer
    applies, in order: SSSD attention → CHAM associative memory → M-CMoE —
    each as a residual sub-layer with its own pre-norm.

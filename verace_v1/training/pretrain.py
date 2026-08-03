@@ -41,6 +41,13 @@ def train_pretrain_step(
         input_ids, images=images, use_adaptive_depth=True, return_hidden=True
     )
 
+    # When images are prepended (no media placeholder configured or matched in this
+    # batch -- see VeraceV1Model._fuse_visual_tokens), logits gains one position per
+    # visual token. Align to labels' length by keeping the trailing (text) positions;
+    # the prepended visual positions have no next-token target to predict.
+    if logits.shape[1] != labels.shape[1]:
+        logits = logits[:, -labels.shape[1]:, :]
+
     # Next token prediction loss
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()

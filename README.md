@@ -52,9 +52,10 @@ compute to each token.
 flowchart TD
     TXT["input_ids"] --> EMB["embed_tokens"]
     IMG["images (optional)"] --> VIS["Vision Encoder\n2x2 token merge -> hidden_dim"]
-    VIS -- "overwrites leading positions" --> EMB
+    VIS --> FUSE["fuse: replace placeholder\ntoken positions, or prepend\n(never overwrite text)"]
+    EMB --> FUSE
 
-    EMB --> ACD
+    FUSE --> ACD
 
     subgraph ACD["Adaptive Cognitive Depth Engine — gates N x decoder layer, per-token early exit"]
         direction TB
@@ -109,7 +110,7 @@ point that isn't wired in yet.
 | **Manifold Continuous MoE (M-CMoE)** | Discrete routed MoE | Per-token low-rank expert weights generated from a shared manifold basis, no all-to-all dispatch |
 | **Adaptive Cognitive Depth Engine (ACDE)** | Fixed per-layer compute | Per-token early exit (ACT-style halting), 2–128 layers per token |
 | **Latent Energy Critic** | Beam / sampling-only decoding | Scalar energy scoring over parallel latent thought branches |
-| **Vision Encoder** | Separate vision-language pipeline | Patch-based ViT with 2×2 token merging, spliced directly into the token sequence |
+| **Vision Encoder** | Separate vision-language pipeline | Patch-based ViT with 2×2 token merging, fused into the token sequence without discarding text |
 | **Unitary Muon Optimizer** | AdamW / plain Muon | Stiefel-manifold-orthogonalized momentum updates |
 
 <p align="center"><sub>Full derivations and code references for each are in <a href="docs/README.md">docs/</a></sub></p>
@@ -217,6 +218,7 @@ verace-v1/
     ├── test_mcmoe.py                # M-CMoE shape/stability test
     ├── test_acd.py                 # ACDE batch-independence & gathering test
     ├── test_unitary_muon.py        # SVD orthogonalization test (square/tall/wide)
+    ├── test_vision_fusion.py       # Vision-token fusion regression tests
     └── test_end2end.py             # Full pipeline integration test
 ```
 
