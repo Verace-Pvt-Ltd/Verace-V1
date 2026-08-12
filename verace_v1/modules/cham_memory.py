@@ -85,7 +85,7 @@ class ContinuousHolographicMemory(nn.Module):
         # GPU Triton Path (Inference fast path)
         if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_cham_triton_update
-            hologram_out, (H_real, H_imag) = launch_cham_triton_update(q, k, v, gamma.squeeze(-1))
+            hologram_out, (H_real, H_imag) = launch_cham_triton_update(q, k, v, gamma.squeeze(-1), initial_hologram)
             y = self.norm(self.w_out(hologram_out))
             return y, (H_real, H_imag)
 

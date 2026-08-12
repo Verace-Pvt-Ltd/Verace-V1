@@ -75,7 +75,9 @@ class ManifoldContinuousMoE(nn.Module):
         # GPU path via Triton kernel (Inference fast path)
         if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_mcmoe_triton_projection
-            manifold_adapt = launch_mcmoe_triton_projection(x_flat, self.u_basis, self.v_basis, router_logits, sigma_all)
+            manifold_adapt = launch_mcmoe_triton_projection(
+                x_flat, self.u_basis, self.v_basis, topk_indices, topk_weights, sigma_all
+            )
             y_flat = base_out + self.norm(manifold_adapt)
             return y_flat.view(b, s, d)
 

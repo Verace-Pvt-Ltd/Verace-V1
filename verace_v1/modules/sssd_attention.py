@@ -74,7 +74,7 @@ class SSSDAttention(nn.Module):
         # GPU Triton Path (Inference fast path)
         if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_sssd_triton_scan
-            o_norm_triton, Psi_state = launch_sssd_triton_scan(q, k, v, delta.squeeze(-1), omega)
+            o_norm_triton, Psi_state = launch_sssd_triton_scan(q, k, v, delta.squeeze(-1), initial_state)
             o_norm = self.head_rmsnorm(o_norm_triton).view(b, s, self.num_heads * self.head_dim)
             output = self.w_out(o_norm)
             if return_state:
