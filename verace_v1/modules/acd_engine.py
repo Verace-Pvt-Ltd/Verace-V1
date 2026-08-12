@@ -25,6 +25,10 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
         self.energy_threshold = energy_threshold
 
         self.w_halting = nn.Linear(hidden_dim, 1)
+        # Initialize bias to -3.0 so base halting prob per layer is ~0.047,
+        # preventing immediate collapse to min_depth=2 and allowing dynamic depth unrolling.
+        nn.init.constant_(self.w_halting.bias, -3.0)
+        nn.init.normal_(self.w_halting.weight, std=0.01)
 
     def compute_halting_probability(self, h_l: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.w_halting(h_l)).squeeze(-1)

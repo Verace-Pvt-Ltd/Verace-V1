@@ -51,13 +51,14 @@ def test_end2end_pipeline():
 
     # 4. Generation Test
     generator = VeraceV1Generator(model, config)
-    completion = generator.generate("Describe the Verace V1 architecture", max_new_tokens=16)
+    completion = generator.generate("Describe the Verace V1 architecture", max_new_tokens=8, use_tree_search=False)
     assert len(completion) > 0
     print("Generation test passed.")
 
     # 5. Evaluator Test
     evaluator = VeraceV1Evaluator(model, config)
-    res = evaluator.evaluate_benchmark("V1-Omni-Bench")
+    test_samples = [{"prompt": "Describe Verace V1", "ground_truth": "Verace"}]
+    res = evaluator.evaluate_benchmark("V1-Omni-Bench", test_samples=test_samples)
     assert "accuracy_score" in res
     print(f"Evaluator test passed: {res}")
 

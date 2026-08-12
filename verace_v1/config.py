@@ -14,7 +14,7 @@ from typing import List, Optional, Any
 class VeraceV1Config:
     """Verace V1 architecture and hyperparameter specification."""
     # Core Model Dimensions
-    vocab_size: int = 262144        # Vocabulary size
+    vocab_size: int = 163840        # Vocabulary size (matches official Moonshot Kimi K3 tokenizer)
     hidden_dim: int = 16384         # Hidden state dimension
     num_layers: int = 128           # Maximum number of decoder layers
     num_heads: int = 128            # Number of attention heads
@@ -35,7 +35,7 @@ class VeraceV1Config:
     # Adaptive Cognitive Depth Engine (ACDE)
     max_cognitive_depth: int = 128  # Maximum layer unrolling per token
     min_cognitive_depth: int = 2    # Minimum layers for trivial tokens
-    energy_halting_threshold: float = 0.01 # Halting energy threshold
+    energy_halting_threshold: float = 0.99 # ACT cumulative halting threshold
 
     # Latent Tree Search & Energy Critic
     tree_branches: int = 4          # Parallel latent reasoning rollout branches

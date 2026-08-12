@@ -19,10 +19,15 @@ class VeraceV1Generator:
     """
     Verace V1 generator: adaptive-depth decoding with optional latent tree search.
     """
-    def __init__(self, model: VeraceV1Model, config: VeraceV1Config):
+    def __init__(self, model: VeraceV1Model, config: VeraceV1Config, tokenizer: Optional[Any] = None):
         self.model = model
         self.config = config
         self.formatter = HyperXTMLFormatter()
+        if tokenizer is None:
+            from verace_v1.tokenizer import VeraceTokenizer
+            self.tokenizer = VeraceTokenizer(vocab_size=config.vocab_size)
+        else:
+            self.tokenizer = tokenizer
 
     @torch.no_grad()
     def generate(
@@ -35,16 +40,13 @@ class VeraceV1Generator:
     ) -> str:
         """
         use_tree_search: if True (default), select each token by minimum latent energy
-            over `num_branches` sampled candidates (see `_select_branch_by_energy`).
-            If False, sample a single token from the temperature-scaled distribution —
-            cheaper (one forward pass per token instead of num_branches + 1).
-        num_branches: candidates evaluated per step; defaults to config.tree_branches.
+            over `num_branches` sampled candidates.
         """
         self.model.eval()
         num_branches = num_branches or self.config.tree_branches
 
-        input_bytes = prompt_text.encode("utf-8")
-        input_ids = torch.tensor([[b % self.config.vocab_size for b in input_bytes]], dtype=torch.long, device=next(self.model.parameters()).device)
+        tokens = self.tokenizer.encode(prompt_text)
+        input_ids = torch.tensor([tokens], dtype=torch.long, device=next(self.model.parameters()).device)
 
         generated_tokens = []
 
@@ -62,10 +64,10 @@ class VeraceV1Generator:
             generated_tokens.append(next_token)
             input_ids = torch.cat([input_ids, torch.tensor([[next_token]], device=input_ids.device)], dim=1)
 
-            if next_token == 0:
+            if next_token == self.tokenizer.eos_token_id and len(generated_tokens) > 1:
                 break
 
-        completion = bytes([t % 256 for t in generated_tokens]).decode("utf-8", errors="ignore")
+        completion = self.tokenizer.decode(generated_tokens)
         return completion
 
     def _select_branch_by_energy(

@@ -1,0 +1,15 @@
+Files in this directory (tiktoken.model, tokenization_kimi.py, encoding_k3.py,
+tokenizer_config.json) are vendored, unmodified, from Moonshot AI's official Kimi K3
+release:
+
+    https://huggingface.co/moonshotai/Kimi-K3
+
+Copyright (c) 2026 Moonshot AI. Licensed under the terms in LICENSE (this directory).
+The Kimi K3 License is a permissive MIT-style license with commercial-scale carve-outs
+(see LICENSE); Section 1 requires the license notice be retained in copies -- this NOTICE
+file and the accompanying LICENSE file serve that purpose for this vendored copy.
+
+This is the ACTUAL tokenizer Kimi K3 uses (a tiktoken-based BPE with a custom
+`TikTokenTokenizer` wrapper and an `encoding_k3.build_chat_segments` XTML chat-template
+renderer) -- not a re-derivation from the paper's prose. See
+kimi_k3/tokenizer/real_tokenizer.py for the wrapper that loads it.

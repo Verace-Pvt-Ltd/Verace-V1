@@ -67,10 +67,12 @@ class SSSDAttention(nn.Module):
 
         # Zero-Delta Identity Recurrence for Halted Tokens: delta = 0 when active_mask is False
         if active_mask is not None:
-            delta = delta * active_mask.unsqueeze(-1).unsqueeze(-1).to(delta.dtype)
+            while active_mask.ndim < delta.ndim:
+                active_mask = active_mask.unsqueeze(-1)
+            delta = delta * active_mask.to(delta.dtype)
 
-        # GPU Triton Path
-        if x.is_cuda and HAS_TRITON:
+        # GPU Triton Path (Inference fast path)
+        if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_sssd_triton_scan
             o_norm_triton, Psi_state = launch_sssd_triton_scan(q, k, v, delta.squeeze(-1), omega)
             o_norm = self.head_rmsnorm(o_norm_triton).view(b, s, self.num_heads * self.head_dim)
@@ -79,48 +81,75 @@ class SSSDAttention(nn.Module):
                 return output, Psi_state
             return output, None
 
-        # Exact Lie-Algebra Skew-Symmetric Unitary Update Path (PyTorch)
+        # Exact Lie-Algebra Skew-Symmetric Unitary Update Path via O(log S) Parallel Prefix Scan
         if initial_state is not None:
-            Psi = initial_state
+            Psi_0 = initial_state
         else:
-            # Initialize to identity state (norm = 1.0 per column)
-            Psi = torch.eye(self.head_dim, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0).repeat(b, self.num_heads, 1, 1)
+            Psi_0 = torch.eye(self.head_dim, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0).repeat(b, self.num_heads, 1, 1)
 
         eye = torch.eye(self.head_dim, device=x.device, dtype=x.dtype)
-        outputs = []
 
-        for t in range(s):
-            q_t = q[:, t]       # [b, h, d_k]
-            k_t = k[:, t]       # [b, h, d_k]
-            v_t = v[:, t]       # [b, h, d_k]
-            d_t = delta[:, t]   # [b, h, 1]
+        # 1. Parallel construction of all skew-symmetric generators A_t and Cayley rotation matrices R_t
+        kt_col = k.transpose(1, 2).unsqueeze(-1) # [b, h, s, d_k, 1]
+        vt_row = v.transpose(1, 2).unsqueeze(-2) # [b, h, s, 1, d_k]
+        vt_col = v.transpose(1, 2).unsqueeze(-1)
+        kt_row = k.transpose(1, 2).unsqueeze(-2)
 
-            # 1. Construct Skew-Symmetric Lie Generator: A_t = k_t v_t^T - v_t k_t^T
-            kt_col = k_t.unsqueeze(-1) # [b, h, d_k, 1]
-            vt_row = v_t.unsqueeze(-2) # [b, h, 1, d_k]
-            vt_col = v_t.unsqueeze(-1)
-            kt_row = k_t.unsqueeze(-2)
+        A_seq = torch.matmul(kt_col, vt_row) - torch.matmul(vt_col, kt_row) # [b, h, s, d_k, d_k]
+        d_seq = delta.transpose(1, 2).unsqueeze(-1) # [b, h, s, 1, 1]
 
-            A_t = torch.matmul(kt_col, vt_row) - torch.matmul(vt_col, kt_row) # [b, h, d_k, d_k] (A^T = -A)
+        scale_A = 0.5 * d_seq * A_seq
+        left = eye - scale_A
+        right = eye + scale_A
+        R_seq = torch.linalg.solve(right, left) # [b, h, s, d_k, d_k] Exact Orthogonal R_t
 
-            # 2. Cayley Transform for Exact Unitary Rotation Matrix R_t \in SO(d_k):
-            # R_t = (I - 0.5 * delta * A_t)^{-1} * (I + 0.5 * delta * A_t)
-            scale_A = 0.5 * d_t.unsqueeze(-1) * A_t
-            left = eye - scale_A
-            right = eye + scale_A
-            R_t = torch.linalg.solve(right, left) # R_t^T * R_t = I (Exact Orthogonal/Unitary)
+        # 2. Logarithmic O(log2 S) Associative Parallel Prefix Scan over matrix multiplications
+        P_seq = parallel_prefix_scan(R_seq) # [b, h, s, d_k, d_k] P_t = R_t * R_{t-1} * ... * R_1
 
-            # 3. Exact Norm-Preserving State Rotation: Psi_t = R_t * Psi_{t-1}
-            Psi = torch.matmul(R_t, Psi) # ||Psi_t||_F == ||Psi_{t-1}||_F (Exact Conservation!)
+        # 3. Parallel state & read output computation across all timesteps
+        # Psi_t = P_t * Psi_0
+        Psi_seq = torch.matmul(P_seq, Psi_0.unsqueeze(2)) # [b, h, s, d_k, d_k]
+        q_col = q.transpose(1, 2).unsqueeze(-1) # [b, h, s, d_k, 1]
+        o_seq = torch.matmul(Psi_seq, q_col).squeeze(-1).transpose(1, 2) # [b, s, h, d_k]
 
-            # Read Output
-            o_t = torch.matmul(Psi, q_t.unsqueeze(-1)).squeeze(-1) # [b, h, d_k]
-            outputs.append(o_t)
-
-        o_tilde = torch.stack(outputs, dim=1)
-        o_norm = self.head_rmsnorm(o_tilde).view(b, s, self.num_heads * self.head_dim)
+        o_norm = self.head_rmsnorm(o_seq.contiguous()).reshape(b, s, self.num_heads * self.head_dim)
         output = self.w_out(o_norm)
 
         if return_state:
-            return output, Psi
+            return output, Psi_seq[:, :, -1]
         return output, None
+
+
+def parallel_prefix_scan(R_seq: torch.Tensor) -> torch.Tensor:
+    """
+    Computes associative prefix products P_t = R_t @ R_{t-1} ... @ R_1 in O(log2 S) parallel depth.
+    R_seq shape: [batch, heads, seq_len, dim, dim]
+    """
+    b, h, s, d, _ = R_seq.shape
+    if s == 1:
+        return R_seq
+
+    s_pad = 1 << (s - 1).bit_length()
+    if s_pad > s:
+        pad = torch.eye(d, device=R_seq.device, dtype=R_seq.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(b, h, s_pad - s, 1, 1)
+        R_seq = torch.cat([R_seq, pad], dim=2)
+
+    P = R_seq.clone()
+
+    # Up-sweep (Reduce) phase
+    step = 1
+    while step < s_pad:
+        idx_dst = torch.arange(2 * step - 1, s_pad, 2 * step, device=R_seq.device)
+        idx_src = idx_dst - step
+        P[:, :, idx_dst] = torch.matmul(P[:, :, idx_dst], P[:, :, idx_src])
+        step *= 2
+
+    # Down-sweep phase
+    step = s_pad // 4
+    while step > 0:
+        idx_dst = torch.arange(3 * step - 1, s_pad, 2 * step, device=R_seq.device)
+        idx_src = idx_dst - step
+        P[:, :, idx_dst] = torch.matmul(P[:, :, idx_dst], P[:, :, idx_src])
+        step //= 2
+
+    return P[:, :, :s]

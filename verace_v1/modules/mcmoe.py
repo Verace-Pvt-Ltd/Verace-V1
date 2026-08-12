@@ -72,8 +72,8 @@ class ManifoldContinuousMoE(nn.Module):
 
         sigma_all = torch.sigmoid(self.hyper_sigma(x_flat)).view(b * s, self.num_components, self.rank)
 
-        # GPU path via Triton kernel
-        if x.is_cuda and HAS_TRITON:
+        # GPU path via Triton kernel (Inference fast path)
+        if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_mcmoe_triton_projection
             manifold_adapt = launch_mcmoe_triton_projection(x_flat, self.u_basis, self.v_basis, router_logits, sigma_all)
             y_flat = base_out + self.norm(manifold_adapt)

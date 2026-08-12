@@ -78,46 +78,116 @@ class ContinuousHolographicMemory(nn.Module):
 
         # Zero-Gamma Identity Recurrence for Halted Tokens: gamma = 0 when active_mask is False
         if active_mask is not None:
-            gamma = gamma * active_mask.unsqueeze(-1).to(gamma.dtype)
+            while active_mask.ndim < gamma.ndim:
+                active_mask = active_mask.unsqueeze(-1)
+            gamma = gamma * active_mask.to(gamma.dtype)
 
-        # GPU Triton Path
-        if x.is_cuda and HAS_TRITON:
+        # GPU Triton Path (Inference fast path)
+        if x.is_cuda and HAS_TRITON and not x.requires_grad:
             from verace_v1.serving.triton_kernels import launch_cham_triton_update
             hologram_out, (H_real, H_imag) = launch_cham_triton_update(q, k, v, gamma.squeeze(-1))
             y = self.norm(self.w_out(hologram_out))
             return y, (H_real, H_imag)
 
+        # O(log S) Associative Parallel Prefix Scan Path
         if initial_hologram is not None:
-            H_real, H_imag = initial_hologram
+            H_r_0, H_i_0 = initial_hologram
         else:
             eye = torch.eye(self.holographic_dim, device=x.device, dtype=x.dtype).unsqueeze(0).repeat(b, 1, 1)
-            H_real = eye
-            H_imag = torch.zeros_like(eye)
+            H_r_0 = eye
+            H_i_0 = torch.zeros_like(eye)
 
-        outputs = []
+        kt_col = k.unsqueeze(-1) # [b, s, h_dim, 1]
+        vt_row = v.unsqueeze(-2) # [b, s, 1, h_dim]
+        kv_seq = torch.matmul(kt_col, vt_row) # [b, s, h_dim, h_dim]
 
-        for t in range(s):
-            q_t = q[:, t]
-            k_t = k[:, t]
-            v_t = v[:, t]
-            g_t = gamma[:, t]
+        eye_seq = torch.eye(self.holographic_dim, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+        g_seq = gamma.unsqueeze(-1)
 
-            kt_col = k_t.unsqueeze(-1)
-            vt_row = v_t.unsqueeze(-2)
-            kv_outer = torch.matmul(kt_col, vt_row)
+        # Infinitesimal Unitary Transformation sequence: U_t = I + i * g_t * (k_t v_t^T)
+        U_r_seq = eye_seq.repeat(b, s, 1, 1)
+        U_i_seq = g_seq * kv_seq # [b, s, h_dim, h_dim]
 
-            # Infinitesimal Unitary Transformation: H_next = H * (I + i * g_t * kv_outer)
-            H_real_next = H_real - g_t.unsqueeze(-1) * torch.matmul(H_imag, kv_outer)
-            H_imag_next = H_imag + g_t.unsqueeze(-1) * torch.matmul(H_real, kv_outer)
+        # Logarithmic O(log2 S) Associative Parallel Prefix Scan over complex matrix sequence
+        P_r_seq, P_i_seq = parallel_complex_prefix_scan(U_r_seq, U_i_seq)
 
-            # Exact Newton-Schulz Unitary Retraction to guarantee H^H * H = I
-            H_real, H_imag = newton_schulz_unitary_retraction(H_real_next, H_imag_next, steps=3)
+        # Compute prefix holograms H_t = H_0 * P_t
+        H_r_seq = torch.matmul(H_r_0.unsqueeze(1), P_r_seq) - torch.matmul(H_i_0.unsqueeze(1), P_i_seq)
+        H_i_seq = torch.matmul(H_r_0.unsqueeze(1), P_i_seq) + torch.matmul(H_i_0.unsqueeze(1), P_r_seq)
 
-            # Holographic Recall: Re(H * q_t)
-            rec_t = torch.matmul(H_real, q_t.unsqueeze(-1)).squeeze(-1)
-            outputs.append(rec_t)
+        # Parallel Newton-Schulz Unitary Retraction across all sequence positions
+        H_r_seq, H_i_seq = parallel_newton_schulz_retraction(H_r_seq, H_i_seq, steps=3)
 
-        hologram_out = torch.stack(outputs, dim=1)
-        y = self.norm(self.w_out(hologram_out))
+        # Holographic Recall: Re(H_t * q_t) across all positions in parallel
+        rec_seq = torch.matmul(H_r_seq, q.unsqueeze(-1)).squeeze(-1) # [b, s, h_dim]
+        y = self.norm(self.w_out(rec_seq))
 
-        return y, (H_real, H_imag)
+        return y, (H_r_seq[:, -1], H_i_seq[:, -1])
+
+
+def parallel_complex_prefix_scan(U_r: torch.Tensor, U_i: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes associative complex matrix prefix products in O(log2 S) parallel depth.
+    U = U_r + i * U_i of shape [batch, seq_len, dim, dim]
+    """
+    b, s, d, _ = U_r.shape
+    if s == 1:
+        return U_r, U_i
+
+    s_pad = 1 << (s - 1).bit_length()
+    if s_pad > s:
+        pad_r = torch.eye(d, device=U_r.device, dtype=U_r.dtype).unsqueeze(0).unsqueeze(0).repeat(b, s_pad - s, 1, 1)
+        pad_i = torch.zeros_like(pad_r)
+        U_r = torch.cat([U_r, pad_r], dim=1)
+        U_i = torch.cat([U_i, pad_i], dim=1)
+
+    P_r, P_i = U_r.clone(), U_i.clone()
+
+    step = 1
+    while step < s_pad:
+        idx_dst = torch.arange(2 * step - 1, s_pad, 2 * step, device=U_r.device)
+        idx_src = idx_dst - step
+
+        dst_r, dst_i = P_r[:, idx_dst], P_i[:, idx_dst]
+        src_r, src_i = P_r[:, idx_src], P_i[:, idx_src]
+
+        # Complex matrix multiply: (dst_r + i*dst_i) * (src_r + i*src_i)
+        next_r = torch.matmul(dst_r, src_r) - torch.matmul(dst_i, src_i)
+        next_i = torch.matmul(dst_r, src_i) + torch.matmul(dst_i, src_r)
+
+        P_r[:, idx_dst], P_i[:, idx_dst] = next_r, next_i
+        step *= 2
+
+    step = s_pad // 4
+    while step > 0:
+        idx_dst = torch.arange(3 * step - 1, s_pad, 2 * step, device=U_r.device)
+        idx_src = idx_dst - step
+
+        dst_r, dst_i = P_r[:, idx_dst], P_i[:, idx_dst]
+        src_r, src_i = P_r[:, idx_src], P_i[:, idx_src]
+
+        next_r = torch.matmul(dst_r, src_r) - torch.matmul(dst_i, src_i)
+        next_i = torch.matmul(dst_r, src_i) + torch.matmul(dst_i, src_r)
+
+        P_r[:, idx_dst], P_i[:, idx_dst] = next_r, next_i
+        step //= 2
+
+    return P_r[:, :s], P_i[:, :s]
+
+
+def parallel_newton_schulz_retraction(H_real: torch.Tensor, H_imag: torch.Tensor, steps: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Parallel Newton-Schulz Unitary Retraction over 4D tensor [b, s, d, d]."""
+    b, s, d, _ = H_real.shape
+    eye = torch.eye(d, device=H_real.device, dtype=H_real.dtype).unsqueeze(0).unsqueeze(0)
+
+    for _ in range(steps):
+        HH_r = torch.matmul(H_real.transpose(-1, -2), H_real) + torch.matmul(H_imag.transpose(-1, -2), H_imag)
+        HH_i = torch.matmul(H_real.transpose(-1, -2), H_imag) - torch.matmul(H_imag.transpose(-1, -2), H_real)
+
+        diff_r = 3.0 * eye - HH_r
+        diff_i = -HH_i
+
+        H_real = 0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i))
+        H_imag = 0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r))
+
+    return H_real, H_imag

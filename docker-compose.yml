@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  verace-v1-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: verace-v1-serving
+    ports:
+      - "8000:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: always
