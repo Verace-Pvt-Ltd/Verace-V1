@@ -6,10 +6,8 @@ with fallback to Tiktoken / HuggingFace / ByteLevel BPE.
 
 from typing import List, Union, Optional
 import os
-import sys
 
-_MOONSHOT_DIR_LOCAL = os.path.join(os.path.dirname(__file__), "moonshot")
-_MOONSHOT_DIR_EXT = "/media/krrish/data/Verace/Kimi_K3/kimi_k3/tokenizer/moonshot"
+_MOONSHOT_DIR = os.path.join(os.path.dirname(__file__), "moonshot")
 
 class VeraceTokenizer:
     """
@@ -22,19 +20,17 @@ class VeraceTokenizer:
         self.backend = "moonshot_k3"
 
         if moonshot_dir is None:
-            moonshot_dir = _MOONSHOT_DIR_LOCAL if os.path.exists(_MOONSHOT_DIR_LOCAL) else _MOONSHOT_DIR_EXT
+            moonshot_dir = _MOONSHOT_DIR
 
-        # 1. Load Moonshot Kimi K3 official tokenizer
+        # 1. Load Moonshot Kimi K3 official tokenizer (vendored in verace_v1/tokenizer/moonshot/,
+        # self-contained -- no path outside this package is ever referenced).
         if os.path.exists(moonshot_dir):
             try:
-                kimi_k3_path = "/media/krrish/data/Verace/Kimi_K3"
-                if kimi_k3_path not in sys.path:
-                    sys.path.insert(0, kimi_k3_path)
-                from kimi_k3.tokenizer.real_tokenizer import MoonshotKimiTokenizer
+                from verace_v1.tokenizer.real_tokenizer import MoonshotKimiTokenizer
                 self.tokenizer = MoonshotKimiTokenizer(vocab_dir=moonshot_dir)
                 self.vocab_size = min(vocab_size, self.tokenizer.vocab_size)
                 self.backend = "moonshot_k3"
-            except Exception as e:
+            except Exception:
                 self.tokenizer = None
 
         # 2. Tiktoken fallback

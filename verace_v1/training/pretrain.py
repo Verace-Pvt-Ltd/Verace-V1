@@ -14,6 +14,7 @@ from typing import Tuple, Dict, Optional, Any
 from verace_v1.config import VeraceV1Config
 from verace_v1.modules.backbone import VeraceV1Model, VeraceV1Layer
 from verace_v1.optimizer.unitary_muon import UnitaryMuon
+from verace_v1.training.diagnostics import depth_distribution_stats
 
 try:
     import torch.distributed as dist
@@ -113,13 +114,18 @@ def train_pretrain_step(
     batch: dict,
     depth_penalty_weight: float = 0.001,
     energy_penalty_weight: float = 0.01,
-    use_amp: bool = True
+    use_amp: bool = True,
+    diagnostics: Optional[Dict] = None
 ) -> Tuple[float, float]:
     """
     Production pre-training step minimizing:
         ce_loss + depth_penalty_weight * mean(depth_counts)
                 + energy_penalty_weight * mean(E(h_{t-1}, h_t))
     Supports AMP bfloat16 mixed precision.
+
+    Pass a dict via `diagnostics` to have it populated in-place with
+    depth_distribution_stats(depth_counts) (see verace_v1/training/diagnostics.py)
+    -- purely additive, existing callers that don't pass it see no change.
     """
     model.train()
     optimizer.zero_grad()
@@ -156,6 +162,9 @@ def train_pretrain_step(
         energy_loss = energy_penalty_weight * energy_per_example.mean()
 
         total_loss = ce_loss + depth_loss + energy_loss
+
+    if diagnostics is not None:
+        diagnostics.update(depth_distribution_stats(depth_counts))
 
     total_loss.backward()
     optimizer.step()

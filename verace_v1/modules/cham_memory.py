@@ -118,22 +118,32 @@ class ContinuousHolographicMemory(nn.Module):
             U_r_seq = eye_seq.repeat(b, s, 1, 1)
             U_i_seq = g_seq * kv_seq # [b, s, h_dim, h_dim]
 
-            # Logarithmic O(log2 S) Associative Parallel Prefix Scan over complex matrix sequence
+            # Logarithmic O(log2 S) Associative Parallel Prefix Scan over complex matrix sequence.
+            # This chunk's own raw product, newest-leftmost: P_t = U_t @ ... @ U_(chunk start).
             P_r_seq, P_i_seq = parallel_complex_prefix_scan(U_r_seq, U_i_seq)
 
-            # Compute prefix holograms H_t = H_0 * P_t
-            H_r_seq = torch.matmul(H_r_0.unsqueeze(1), P_r_seq) - torch.matmul(H_i_0.unsqueeze(1), P_i_seq)
-            H_i_seq = torch.matmul(H_r_0.unsqueeze(1), P_i_seq) + torch.matmul(H_i_0.unsqueeze(1), P_r_seq)
+            # Compose with the incoming raw state H_0 (identity for a fresh sequence, or the
+            # raw -- never retracted -- state from a previous call/chunk): since new tokens'
+            # rotations are left-multiplied onto the running product, continuing correctly
+            # across a chunk boundary requires H_0 on the RIGHT (H_0 @ nothing before this
+            # chunk's own tokens), i.e. Total_t = P_t @ H_0, not H_0 @ P_t -- multiplication
+            # isn't commutative, and H_0 @ P_t silently gives the wrong answer for any
+            # non-identity H_0 (invisible on a fresh sequence, where H_0 = I).
+            H_r_seq_raw = torch.matmul(P_r_seq, H_r_0.unsqueeze(1)) - torch.matmul(P_i_seq, H_i_0.unsqueeze(1))
+            H_i_seq_raw = torch.matmul(P_r_seq, H_i_0.unsqueeze(1)) + torch.matmul(P_i_seq, H_r_0.unsqueeze(1))
 
-            # Parallel Newton-Schulz Unitary Retraction across all sequence positions
-            H_r_seq, H_i_seq = parallel_newton_schulz_retraction(H_r_seq, H_i_seq, steps=3)
+            # Parallel Newton-Schulz Unitary Retraction across all sequence positions -- for
+            # the readout only. Retraction is a nonlinear projection and must never be fed
+            # back into the recurrence, so the *raw* H_r_seq_raw/H_i_seq_raw (not this
+            # retracted copy) is what gets exported as the continuable state below.
+            H_r_seq, H_i_seq = parallel_newton_schulz_retraction(H_r_seq_raw, H_i_seq_raw, steps=3)
 
             # Holographic Recall: Re(H_t * q_t) across all positions in parallel
             rec_seq = torch.matmul(H_r_seq, q32.unsqueeze(-1)).squeeze(-1) # [b, s, h_dim]
 
         y = self.norm(self.w_out(rec_seq))
 
-        return y, (H_r_seq[:, -1], H_i_seq[:, -1])
+        return y, (H_r_seq_raw[:, -1], H_i_seq_raw[:, -1])
 
 
 def parallel_complex_prefix_scan(U_r: torch.Tensor, U_i: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

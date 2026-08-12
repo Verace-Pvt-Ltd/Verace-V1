@@ -10,6 +10,8 @@ production-scale run -- override every dimension via CLI flags once the
 pilot proves the architecture trains, to scale up on bigger hardware.
 """
 import argparse
+import json
+import os
 import time
 from dataclasses import dataclass
 
@@ -20,6 +22,7 @@ from verace_v1.dataset.dataset import create_pretrain_dataloader
 from verace_v1.modules.backbone import VeraceV1Model
 from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer
 from verace_v1.tokenizer import VeraceTokenizer
+from verace_v1.training.diagnostics import CHAMInvariantProbe
 from verace_v1.training.pretrain import (
     get_cosine_schedule_with_warmup,
     load_checkpoint,
@@ -85,6 +88,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
 
+    # Experiment tracking -- a local JSONL log is always written (no extra dependency);
+    # wandb is opt-in and degrades to a warning if the package isn't installed.
+    p.add_argument("--wandb", action="store_true", default=False,
+                    help="Also log metrics to Weights & Biases (requires `pip install wandb`).")
+    p.add_argument("--wandb_project", type=str, default="verace-v1-pretrain")
+    p.add_argument("--wandb_run_name", type=str, default=None)
+
     return p.parse_args()
 
 
@@ -142,6 +152,19 @@ def main():
           f"Rough params+grad+optimizer-state memory floor: {est_mem_gb:.2f} GB "
           f"(excludes activations -- reduce --batch_size / --context_length if you OOM).")
 
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    log_path = os.path.join(args.checkpoint_dir, "train_log.jsonl")
+    cham_probe = CHAMInvariantProbe(model)
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+        except ImportError:
+            print("[Verace V1 Pretrain] WARNING: --wandb passed but the `wandb` package isn't "
+                  "installed -- skipping. `pip install wandb` to enable it.")
+
     optimizer = build_hybrid_optimizer(
         model,
         muon_lr=args.muon_lr,
@@ -176,12 +199,15 @@ def main():
                 batch = next(data_iter)
             batch = {k: v.to(args.device) for k, v in batch.items()}
 
+            diagnostics = {}
             ce_loss, mean_depth = train_pretrain_step(
                 model, optimizer, batch,
                 depth_penalty_weight=args.depth_penalty_weight,
                 energy_penalty_weight=args.energy_penalty_weight,
                 use_amp=args.use_amp and args.device == "cuda",
+                diagnostics=diagnostics,
             )
+            cham_deviation = cham_probe.pop_mean_deviation()
             muon_scheduler.step()
             adamw_scheduler.step()
             recent_step_times.append(time.time() - t0)
@@ -189,11 +215,26 @@ def main():
             if step % args.log_every == 0 or step == args.steps - 1:
                 window = recent_step_times[-args.log_every:]
                 avg_ms = (sum(window) / len(window)) * 1000
+                muon_lr = optimizer.muon_optimizer.param_groups[0]["lr"]
+                adamw_lr = optimizer.adamw_optimizer.param_groups[0]["lr"]
+                cham_str = f"{cham_deviation:.2e}" if cham_deviation is not None else "n/a"
+
                 print(f"[step {step}/{args.steps}] loss={ce_loss:.4f} "
-                      f"mean_depth={mean_depth:.2f}/{config.num_layers} "
-                      f"muon_lr={optimizer.muon_optimizer.param_groups[0]['lr']:.2e} "
-                      f"adamw_lr={optimizer.adamw_optimizer.param_groups[0]['lr']:.2e} "
-                      f"{avg_ms:.0f}ms/step")
+                      f"depth={diagnostics.get('depth_mean', mean_depth):.2f}"
+                      f"(std={diagnostics.get('depth_std', 0.0):.2f}, "
+                      f"range=[{diagnostics.get('depth_min', 0):.0f},{diagnostics.get('depth_max', 0):.0f}])"
+                      f"/{config.num_layers} cham_dev={cham_str} "
+                      f"muon_lr={muon_lr:.2e} adamw_lr={adamw_lr:.2e} {avg_ms:.0f}ms/step")
+
+                log_record = {
+                    "step": step, "loss": ce_loss, "cham_deviation": cham_deviation,
+                    "muon_lr": muon_lr, "adamw_lr": adamw_lr, "ms_per_step": avg_ms,
+                    **diagnostics,
+                }
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(log_record) + "\n")
+                if wandb_run is not None:
+                    wandb_run.log(log_record, step=step)
 
             if (step + 1) % args.save_every == 0:
                 save_checkpoint(model, optimizer, step + 1, args.checkpoint_dir)
@@ -201,9 +242,13 @@ def main():
     except KeyboardInterrupt:
         print("[Verace V1 Pretrain] Interrupted -- saving a checkpoint before exiting.")
         save_checkpoint(model, optimizer, step, args.checkpoint_dir)
+        cham_probe.remove()
         raise
 
+    cham_probe.remove()
     save_checkpoint(model, optimizer, args.steps, args.checkpoint_dir)
+    if wandb_run is not None:
+        wandb_run.finish()
     print("[Verace V1 Pretrain] Pilot run complete.")
 
 

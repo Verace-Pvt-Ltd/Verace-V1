@@ -57,7 +57,7 @@ class VeraceV1Layer(nn.Module):
         sssd_state: Optional[torch.Tensor] = None,
         cham_hologram: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         active_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         h_in: [batch, seq_len, hidden_dim]
         block_residual: [total_tokens, num_blocks, hidden_dim]
@@ -98,7 +98,7 @@ class VeraceV1Layer(nn.Module):
         moe_out = self.mcmoe(norm_moe)
         h_out = h_mid2 + moe_out
 
-        return h_out, block_residual, new_sssd_state
+        return h_out, block_residual, new_sssd_state, new_cham_hologram
 
 
 class VeraceV1Model(nn.Module):
@@ -146,7 +146,9 @@ class VeraceV1Model(nn.Module):
         input_ids: torch.Tensor,
         images: Optional[torch.Tensor] = None,
         use_adaptive_depth: bool = True,
-        return_hidden: bool = False
+        return_hidden: bool = False,
+        layer_states: Optional[List] = None,
+        return_layer_states: bool = False
     ):
         """
         input_ids: [batch, seq_len]
@@ -155,6 +157,16 @@ class VeraceV1Model(nn.Module):
         [batch, seq_len, hidden_dim] as a third element — the representation
         consumed by LatentEnergyCritic for branch scoring (see
         verace_v1/serving/hyper_generate.py and verace_v1/training/pretrain.py).
+
+        layer_states / return_layer_states: incremental-decoding support (only
+        for use_adaptive_depth=True). `layer_states` is the per-layer, per-batch-item
+        (sssd_state, cham_hologram) state returned by a previous call with
+        return_layer_states=True -- pass it back in along with only the *new*
+        input_ids (e.g. the single latest token) to continue the SSSD/CHAM
+        recurrence from where it left off, instead of recomputing the whole
+        growing sequence every call. First call: layer_states=None (fresh
+        per-item identity init, same as before this was added). See
+        verace_v1/serving/hyper_generate.py for the actual incremental loop.
         """
         b, s = input_ids.shape
         token_embeds = self.embed_tokens(input_ids) # [b, s, d]
@@ -164,27 +176,33 @@ class VeraceV1Model(nn.Module):
             token_embeds = self._fuse_visual_tokens(token_embeds, input_ids, visual_tokens)
             b, s = token_embeds.shape[0], token_embeds.shape[1]
 
+        final_layer_states = None
         if use_adaptive_depth:
             # Dynamic layer unrolling per token via Adaptive Cognitive Depth Engine
-            final_h, depth_counts = self.acd_engine.execute_adaptive_recurrent_loop(
+            final_h, depth_counts, final_layer_states = self.acd_engine.execute_adaptive_recurrent_loop(
                 layers=self.layers,
                 h_in=token_embeds,
                 max_depth=self.config.max_cognitive_depth,
-                min_depth=self.config.min_cognitive_depth
+                min_depth=self.config.min_cognitive_depth,
+                initial_layer_states=layer_states
             )
         else:
             # Static unrolling fallback
             h_curr = token_embeds
             for layer in self.layers:
-                h_curr, _, _ = layer(h_curr)
+                h_curr, _, _, _ = layer(h_curr)
             final_h = h_curr
             depth_counts = torch.full((b, s), len(self.layers), device=input_ids.device, dtype=torch.int32)
 
         norm_final_h = self.final_norm(final_h)
         logits = self.lm_head(norm_final_h)
 
+        if return_hidden and return_layer_states:
+            return logits, depth_counts, norm_final_h, final_layer_states
         if return_hidden:
             return logits, depth_counts, norm_final_h
+        if return_layer_states:
+            return logits, depth_counts, final_layer_states
         return logits, depth_counts
 
     def _fuse_visual_tokens(

@@ -160,19 +160,25 @@ if HAS_TRITON:
         Sequential complex unitary holographic scan, one program per batch element.
 
         The reference builds this as P_t = U_t @ U_{t-1} @ ... @ U_1 (a RAW, never-retracted
-        prefix product, via cham_memory.py's parallel_complex_prefix_scan), then computes
-        H_t = H_0 @ P_t and retracts (Newton-Schulz) each position's H_t independently.
-        Retraction is a nonlinear projection, so this is NOT the same function as retracting
-        after every step and feeding the retracted value back into the recurrence (that
-        alternative was tried and verified to diverge from the reference, growing with
-        sequence length, since it corrects drift the reference's formula does not correct
-        until the very end of each position's own prefix). To match exactly: P (raw, unitary
-        only to first order per step, never corrected) is what's actually carried across
-        steps; H_0 is applied and NS-retracted fresh at every position for the readout only,
-        and next step's rank-1 update is applied to the raw P, not to the retracted readout.
+        prefix product, via cham_memory.py's parallel_complex_prefix_scan), then composes it
+        with the incoming state H_0 as Total_t = P_t @ H_0 (H_0 on the RIGHT -- new tokens'
+        rotations are left-multiplied onto the running product, so continuing correctly
+        across a call boundary requires H_0 to sit after this chunk's own P, not before it;
+        H_0 @ P_t is only equivalent when H_0 = I, which is why this was invisible on a
+        single fresh sequence) and retracts (Newton-Schulz) each position's Total_t
+        independently for the readout only. Retraction is a nonlinear projection, so this is
+        NOT the same function as retracting after every step and feeding the retracted value
+        back into the recurrence (that alternative was tried and verified to diverge from the
+        reference, growing with sequence length, since it corrects drift the reference's
+        formula does not correct until the very end of each position's own prefix). To match
+        exactly: P (raw, unitary only to first order per step, never corrected) is what's
+        actually carried across steps AND exported as the final state for a caller to
+        continue from; H_0 is composed in and NS-retracted fresh at every position for the
+        readout only, and next step's rank-1 update is applied to the raw P, not to the
+        retracted readout.
 
         U_t = I + i*gamma_t*(k_t v_t^T); k_t v_t^T is rank-1, so U_t @ P is applied in
-        O(h_dim^2) without a dense matmul: (k v^T) @ P = k (v^T P). H_0 @ P and the
+        O(h_dim^2) without a dense matmul: (k v^T) @ P = k (v^T P). P @ H_0 and the
         Newton-Schulz retraction matmuls are genuine dense products (tl.dot).
         """
         pid_b = tl.program_id(0)
@@ -198,8 +204,12 @@ if HAS_TRITON:
         P_i = tl.zeros((BLOCK_H, BLOCK_H), dtype=tl.float32)
 
         NS_STEPS: tl.constexpr = 3
-        Hro_r = H0_r
-        Hro_i = H0_i
+        # Hraw_r/Hraw_i: this chunk's local raw P combined with H_0 (Total_t = P_t @ H_0),
+        # BEFORE retraction -- this, not the purely-local P_r/P_i and not the retracted
+        # Hro_r/Hro_i, is what must be exported as the continuable state (see module
+        # docstring: H_0 belongs on the right, and retraction must never feed back in).
+        Hraw_r = H0_r
+        Hraw_i = H0_i
 
         for t in range(seq_len):
             t_off = seq_base + t * h_dim
@@ -214,11 +224,13 @@ if HAS_TRITON:
             P_r = P_r - g * (k[:, None] * vT_Pi[None, :])
             P_i = P_i + g * (k[:, None] * vT_Pr[None, :])
 
-            # Readout: H_t = H_0 @ P_t, retracted fresh from the raw P -- this copy is
-            # discarded after the readout, it does NOT feed back into P.
-            Hro_r = tl.dot(H0_r, P_r, allow_tf32=False) - tl.dot(H0_i, P_i, allow_tf32=False)
-            Hro_i = tl.dot(H0_r, P_i, allow_tf32=False) + tl.dot(H0_i, P_r, allow_tf32=False)
+            # Combined raw readout: Total_t = P_t @ H_0 (H_0 on the right -- see docstring).
+            Hraw_r = tl.dot(P_r, H0_r, allow_tf32=False) - tl.dot(P_i, H0_i, allow_tf32=False)
+            Hraw_i = tl.dot(P_r, H0_i, allow_tf32=False) + tl.dot(P_i, H0_r, allow_tf32=False)
 
+            # Retract a separate copy for this step's output only -- discarded after the
+            # readout, does NOT feed back into P or Hraw.
+            Hro_r, Hro_i = Hraw_r, Hraw_i
             for _ in range(NS_STEPS):
                 Ht_r = tl.trans(Hro_r)
                 Ht_i = tl.trans(Hro_i)
@@ -236,10 +248,13 @@ if HAS_TRITON:
             rec = tl.sum(Hro_r * q[None, :], axis=1)
             tl.store(out_ptr + t_off + offs, rec.to(out_ptr.dtype.element_ty), mask=mask_d)
 
-        # Final returned state is the last position's retracted readout, matching the
-        # reference's H_r_seq[:, -1] / H_i_seq[:, -1] (post-retraction).
-        tl.store(h_real_out_ptr + state_base + offs[:, None] * h_dim + offs[None, :], Hro_r, mask=mask_2d)
-        tl.store(h_imag_out_ptr + state_base + offs[:, None] * h_dim + offs[None, :], Hro_i, mask=mask_2d)
+        # Final returned state is the last position's RAW (never-retracted) combined total
+        # Hraw_r/Hraw_i, matching the reference's H_r_seq_raw[:, -1] / H_i_seq_raw[:, -1] --
+        # NOT the retracted Hro_r/Hro_i, and NOT the H_0-agnostic local P_r/P_i, either of
+        # which would silently break correctness for a caller that feeds this back in as
+        # the next call's H_0.
+        tl.store(h_real_out_ptr + state_base + offs[:, None] * h_dim + offs[None, :], Hraw_r, mask=mask_2d)
+        tl.store(h_imag_out_ptr + state_base + offs[:, None] * h_dim + offs[None, :], Hraw_i, mask=mask_2d)
 
 
 # =====================================================================
@@ -398,11 +413,13 @@ def _cham_tiled_step(
     k: torch.Tensor, v: torch.Tensor, q: torch.Tensor, g: torch.Tensor, d: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One step: raw rank-1 prefix update (never retracted, carried forward as Pr/Pi),
-    then a fresh readout H_ro = H0 @ P retracted via 3x Newton-Schulz -- matching
-    cham_holographic_scan_kernel's semantics (see its docstring for why retraction must
-    be deferred to the readout rather than fed back into the recurrence). Returns
-    (Pr, Pi, Hro_r, Hro_i, rec); Hro_r/Hro_i is this step's retracted readout, used as the
-    final returned state if this is the last timestep."""
+    then a fresh combined-raw readout Hraw = P @ H0 (H0 on the RIGHT -- see
+    cham_holographic_scan_kernel's docstring for why: new tokens' rotations left-multiply
+    onto the running product, so H0 must be composed in after this chunk's own P, not
+    before it), retracted via 3x Newton-Schulz into a SEPARATE copy for this step's output.
+    Returns (Pr, Pi, Hraw_r, Hraw_i, rec); Hraw_r/Hraw_i (the combined raw value, BEFORE
+    retraction) -- not the purely-local Pr/Pi and not the retracted output -- is what the
+    caller exports as the final continuable state if this is the last timestep."""
     v_row = v.view(1, d)
     vT_Pr = _tiled_matmul(v_row, Pr).view(d)
     vT_Pi = _tiled_matmul(v_row, Pi).view(d)
@@ -416,10 +433,11 @@ def _cham_tiled_step(
         BLOCK_M=BLOCK, BLOCK_N=BLOCK
     )
 
-    Hro_r = _tiled_matmul(H0r, Pr) - _tiled_matmul(H0i, Pi)
-    Hro_i = _tiled_matmul(H0r, Pi) + _tiled_matmul(H0i, Pr)
+    Hraw_r = _tiled_matmul(Pr, H0r) - _tiled_matmul(Pi, H0i)
+    Hraw_i = _tiled_matmul(Pr, H0i) + _tiled_matmul(Pi, H0r)
 
     eye = torch.eye(d, device=Pr.device, dtype=torch.float32)
+    Hro_r, Hro_i = Hraw_r, Hraw_i
     Hro_r_t, Hro_i_t = Hro_r.transpose(-1, -2), Hro_i.transpose(-1, -2)
     for _ in range(3):
         HH_r = _tiled_matmul(Hro_r_t, Hro_r) + _tiled_matmul(Hro_i_t, Hro_i)
@@ -432,7 +450,7 @@ def _cham_tiled_step(
         Hro_r_t, Hro_i_t = Hro_r.transpose(-1, -2), Hro_i.transpose(-1, -2)
 
     rec = _tiled_matmul(Hro_r, q.view(d, 1)).view(d)
-    return Pr, Pi, Hro_r, Hro_i, rec
+    return Pr, Pi, Hraw_r, Hraw_i, rec
 
 
 def launch_cham_triton_tiled(
@@ -469,14 +487,16 @@ def launch_cham_triton_tiled(
     for bi in range(b):
         H0r, H0i = H0r_batch[bi].contiguous(), H0i_batch[bi].contiguous()
         Pr, Pi = eye_d.clone(), torch.zeros(d, d, device=q.device, dtype=torch.float32)
-        Hro_r, Hro_i = H0r, H0i
         for t in range(s):
-            Pr, Pi, Hro_r, Hro_i, rec = _cham_tiled_step(
+            Pr, Pi, Hraw_r, Hraw_i, rec = _cham_tiled_step(
                 Pr, Pi, H0r, H0i, k_f[bi, t], v_f[bi, t], q_f[bi, t], gamma_f[bi, t], d
             )
             out[bi, t] = rec
-        Hr_final[bi] = Hro_r
-        Hi_final[bi] = Hro_i
+        # Raw (never-retracted) combined total P_last @ H0 -- not the purely-local Pr/Pi and
+        # not the retracted per-step output -- see _cham_tiled_step's docstring for why
+        # either of those would silently break correctness for the next call.
+        Hr_final[bi] = Hraw_r
+        Hi_final[bi] = Hraw_i
 
     return out.to(out_dtype), (Hr_final, Hi_final)
 

@@ -38,13 +38,25 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
         layers: nn.ModuleList,
         h_in: torch.Tensor,
         max_depth: int = 128,
-        min_depth: int = 2
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        min_depth: int = 2,
+        initial_layer_states: Optional[List[Optional[List[Optional[Tuple]]]]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[List[Optional[Tuple]]]]]:
         """
         h_in: [batch, seq_len, hidden_dim]
+        initial_layer_states: per-layer list (length min(len(layers), max_depth)) of
+            per-batch-item lists (length b) of (sssd_state, cham_hologram) or None --
+            the SSSD/CHAM recurrent state each layer had reached for each batch item
+            as of a previous call, as returned by this method. Pass None (default) for
+            a fresh sequence; pass the prior return value back in, together with only
+            the *new* tokens in h_in, to continue incrementally (see
+            verace_v1/serving/hyper_generate.py). A batch item/layer that never
+            received real tokens yet stays None, which SSSDAttention/CHAM treat as
+            fresh identity init -- identical behavior to the very first call.
         Returns:
           final_hidden: [batch, seq_len, hidden_dim]
           depth_counts: [batch, seq_len]
+          layer_states: per-layer, per-batch-item state as described above, to pass
+            back in on the next call.
         """
         b, s, d = h_in.shape
         device = h_in.device
@@ -57,6 +69,15 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
 
         num_layers = min(len(layers), max_depth)
         block_residuals = [h_in.new_zeros(s, 0, d) for _ in range(b)]
+
+        # Per-layer, per-batch-item state, seeded from initial_layer_states (shallow-copied
+        # so branching multiple candidates off the same cached state -- e.g. tree search --
+        # never mutates the shared input).
+        layer_states_out: List[List[Optional[Tuple]]] = [
+            (list(initial_layer_states[l]) if initial_layer_states is not None and l < len(initial_layer_states)
+             and initial_layer_states[l] is not None else [None] * b)
+            for l in range(num_layers)
+        ]
 
         for l_idx in range(num_layers):
             if not active_mask.any():
@@ -75,15 +96,22 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
                 h_active_i = h_curr[i, active_indices_i].unsqueeze(0)
                 block_res_i = block_residuals[i][active_indices_i]
 
+                prev_state_i = layer_states_out[l_idx][i]
+                sssd_state_i = prev_state_i[0] if prev_state_i is not None else None
+                cham_hologram_i = prev_state_i[1] if prev_state_i is not None else None
+
                 # Execute the layer only on active tokens for item i
-                layer_out_i, new_block_res_i, _ = layer(
+                layer_out_i, new_block_res_i, new_sssd_state_i, new_cham_hologram_i = layer(
                     h_active_i,
-                    block_residual=block_res_i
+                    block_residual=block_res_i,
+                    sssd_state=sssd_state_i,
+                    cham_hologram=cham_hologram_i
                 )
 
                 # Scatter layer output back to item i
                 h_next[i, active_indices_i] = layer_out_i.squeeze(0)
                 block_residuals[i][active_indices_i] = new_block_res_i
+                layer_states_out[l_idx][i] = (new_sssd_state_i, new_cham_hologram_i)
 
             # Compute Halting Probabilities for active tokens
             p_l = self.compute_halting_probability(h_next)
@@ -115,4 +143,4 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
             remainder_weight = (1.0 - accumulated_prob).clamp(min=0.0)
             final_h = final_h + (remainder_weight * active_mask.to(h_in.dtype)).unsqueeze(-1) * h_curr
 
-        return final_h, depth_counts
+        return final_h, depth_counts, layer_states_out

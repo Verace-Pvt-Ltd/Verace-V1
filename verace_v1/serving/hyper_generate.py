@@ -49,15 +49,24 @@ class VeraceV1Generator:
         input_ids = torch.tensor([tokens], dtype=torch.long, device=next(self.model.parameters()).device)
 
         generated_tokens = []
+        # Threaded across steps: None on the first call (full prompt, fresh per-layer
+        # state); after that, only the single newest token is fed to the model, with
+        # layer_states carrying the SSSD/CHAM recurrence forward -- O(1) per step
+        # instead of recomputing the whole growing sequence every call.
+        layer_states = None
 
         for _ in range(max_new_tokens):
-            logits, depth_counts, hidden = self.model(input_ids, use_adaptive_depth=True, return_hidden=True)
+            step_input_ids = input_ids if layer_states is None else input_ids[:, -1:]
+            logits, depth_counts, hidden, layer_states = self.model(
+                step_input_ids, use_adaptive_depth=True, return_hidden=True,
+                layer_states=layer_states, return_layer_states=True
+            )
 
             next_logits = logits[0, -1, :] / max(1e-5, temperature)
             probs = F.softmax(next_logits, dim=-1)
 
             if use_tree_search and num_branches > 1:
-                next_token = self._select_branch_by_energy(input_ids, probs, hidden, num_branches)
+                next_token, layer_states = self._select_branch_by_energy(layer_states, probs, hidden, num_branches)
             else:
                 next_token = torch.multinomial(probs, num_samples=1).item()
 
@@ -72,18 +81,22 @@ class VeraceV1Generator:
 
     def _select_branch_by_energy(
         self,
-        input_ids: torch.Tensor,
+        layer_states: List,
         probs: torch.Tensor,
         context_hidden: torch.Tensor,
         num_branches: int
-    ) -> int:
+    ):
         """
         Samples `num_branches` candidate next tokens from `probs` (without replacement),
-        runs the model forward on each resulting sequence to get its latent state, and
-        returns the token whose resulting state has minimum energy against the current
-        context (LatentEnergyCritic.compute_energy) — see docs/modules/energy-critic.md.
+        runs the model on each candidate's single new token against the shared cached
+        `layer_states` (not the whole growing sequence) to get its resulting latent
+        state, and returns the token whose resulting state has minimum energy against
+        the current context (LatentEnergyCritic.compute_energy) — see
+        docs/modules/energy-critic.md — along with that winning candidate's resulting
+        layer_states, so the caller can adopt it as the new cache.
 
-        Costs num_branches additional full forward passes per generated token.
+        Costs num_branches additional single-token forward passes per generated token
+        (each O(1) in sequence length, since they reuse the cached prefix state).
         """
         num_branches = min(num_branches, int((probs > 0).sum().item()))
         topk_tokens = torch.multinomial(probs, num_samples=num_branches, replacement=False)
@@ -91,15 +104,18 @@ class VeraceV1Generator:
         x_prompt = context_hidden[:, -1:, :]  # [1, 1, hidden_dim]
 
         candidate_hiddens = []
+        candidate_layer_states = []
         for tok in topk_tokens.tolist():
-            cand_ids = torch.cat(
-                [input_ids, torch.tensor([[tok]], device=input_ids.device)], dim=1
+            tok_id = torch.tensor([[tok]], device=context_hidden.device)
+            _, _, cand_hidden, cand_layer_states = self.model(
+                tok_id, use_adaptive_depth=True, return_hidden=True,
+                layer_states=layer_states, return_layer_states=True
             )
-            _, _, cand_hidden = self.model(cand_ids, use_adaptive_depth=True, return_hidden=True)
             candidate_hiddens.append(cand_hidden[:, -1:, :])
+            candidate_layer_states.append(cand_layer_states)
 
         h_cand = torch.stack(candidate_hiddens, dim=1)  # [1, num_branches, 1, hidden_dim]
         energies = self.model.energy_critic.compute_energy(x_prompt, h_cand)  # [1, num_branches]
         best_idx = torch.argmin(energies, dim=-1).item()
 
-        return topk_tokens[best_idx].item()
+        return topk_tokens[best_idx].item(), candidate_layer_states[best_idx]

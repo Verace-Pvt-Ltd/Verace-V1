@@ -10,6 +10,12 @@ services:
       - "8000:8000"
     environment:
       - CUDA_VISIBLE_DEVICES=0
+      # Required for real inference -- otherwise the model serves random-init output.
+      - VERACE_CHECKPOINT_PATH=${VERACE_CHECKPOINT_PATH:-}
+      # Required before exposing this beyond local development -- see verace_v1/serving/api.py.
+      - VERACE_API_KEY=${VERACE_API_KEY:-}
+      - VERACE_CORS_ORIGINS=${VERACE_CORS_ORIGINS:-}
+      - VERACE_RATE_LIMIT_PER_MINUTE=${VERACE_RATE_LIMIT_PER_MINUTE:-30}
     deploy:
       resources:
         reservations:

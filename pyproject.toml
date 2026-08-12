@@ -20,7 +20,10 @@ classifiers = [
 dependencies = [
     "torch>=2.2.0",
     "numpy>=1.24.0",
-    "triton>=2.2.0"
+    "triton>=2.2.0",
+    "tiktoken>=0.7.0",
+    "tokenizers>=0.19.0",
+    "transformers>=4.40.0"
 ]
 
 [project.urls]
@@ -31,3 +34,6 @@ LinkedIn = "https://www.linkedin.com/company/verace-ai/"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+"verace_v1.tokenizer.moonshot" = ["*.model", "*.json", "LICENSE", "NOTICE"]

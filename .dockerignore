@@ -1,0 +1,13 @@
+.git
+__pycache__
+*.pyc
+.pytest_cache
+checkpoints/
+*.pt
+*.ckpt
+*.safetensors
+.venv
+venv
+*.egg-info
+.mypy_cache
+.ruff_cache

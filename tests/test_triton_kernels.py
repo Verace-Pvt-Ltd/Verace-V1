@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from verace_v1.modules.sssd_attention import SSSDAttention
-from verace_v1.modules.cham_memory import ContinuousHolographicMemory
+from verace_v1.modules.cham_memory import ContinuousHolographicMemory, newton_schulz_unitary_retraction
 from verace_v1.modules.mcmoe import ManifoldContinuousMoE
 
 TOL = dict(rtol=1e-3, atol=1e-4)
@@ -178,8 +178,11 @@ def test_cham_triton_preserves_unitarity_with_halted_tokens():
 
     torch.testing.assert_close(out_tri, out_gold, **FP64_TOL)
 
-    # Newton-Schulz retraction's exactness guarantee: H^H H = I.
-    HH_r = Hr_tri.transpose(-1, -2) @ Hr_tri + Hi_tri.transpose(-1, -2) @ Hi_tri
+    # model()'s second return value is the RAW (never-retracted) state, by design --
+    # see cham_memory.py's forward() docstring. Newton-Schulz retraction's exactness
+    # guarantee (H^H H = I) applies on read, so retract before checking it.
+    Hr_ro, Hi_ro = newton_schulz_unitary_retraction(Hr_tri, Hi_tri)
+    HH_r = Hr_ro.transpose(-1, -2) @ Hr_ro + Hi_ro.transpose(-1, -2) @ Hi_ro
     eye = torch.eye(holographic_dim, device="cuda").unsqueeze(0).expand(b, -1, -1)
     torch.testing.assert_close(HH_r, eye, rtol=1e-3, atol=1e-3)
 

@@ -51,7 +51,7 @@ def test_acd_batch_independence_and_flop_shrinkage():
     layers = model.layers
 
     h_in = torch.randn(2, 8, 64, device="cuda")
-    final_h, depths = engine.execute_adaptive_recurrent_loop(layers, h_in, max_depth=4, min_depth=1)
+    final_h, depths, _ = engine.execute_adaptive_recurrent_loop(layers, h_in, max_depth=4, min_depth=1)
 
     print(f"Per-example gathering verified. Mean cognitive depth: {depths.float().mean():.2f}")
 

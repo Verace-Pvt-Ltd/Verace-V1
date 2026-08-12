@@ -12,12 +12,19 @@ from typing import List, Optional, Any
 
 @dataclass
 class VeraceV1Config:
-    """Verace V1 architecture and hyperparameter specification."""
+    """
+    Verace V1 architecture and hyperparameter specification.
+
+    Defaults below describe a small, immediately-runnable reference size (matches
+    the README quickstart) so `VeraceV1Config()` with no arguments never silently
+    tries to build a many-billion-parameter model. Pass explicit dimensions for a
+    production-scale run.
+    """
     # Core Model Dimensions
     vocab_size: int = 163840        # Vocabulary size (matches official Moonshot Kimi K3 tokenizer)
-    hidden_dim: int = 16384         # Hidden state dimension
-    num_layers: int = 128           # Maximum number of decoder layers
-    num_heads: int = 128            # Number of attention heads
+    hidden_dim: int = 1024          # Hidden state dimension
+    num_layers: int = 12            # Maximum number of decoder layers
+    num_heads: int = 8              # Number of attention heads
     head_dim: int = 128
 
     # Spectral State-Space Differential Attention (SSSD)
@@ -33,7 +40,7 @@ class VeraceV1Config:
     mcmoe_num_components: int = 64  # Number of basis manifold generators
 
     # Adaptive Cognitive Depth Engine (ACDE)
-    max_cognitive_depth: int = 128  # Maximum layer unrolling per token
+    max_cognitive_depth: int = 12   # Maximum layer unrolling per token (clamped to num_layers)
     min_cognitive_depth: int = 2    # Minimum layers for trivial tokens
     energy_halting_threshold: float = 0.99 # ACT cumulative halting threshold
 
