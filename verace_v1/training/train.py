@@ -53,6 +53,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--context_length", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--max_tokens", type=int, default=None,
+                    help="Cap on tokens read from --data_path (stops reading/tokenizing "
+                         "once reached). Omit to use the whole corpus.")
 
     # Model -- pilot-scale defaults sized for a single ~6GB GPU
     p.add_argument("--vocab_size", type=int, default=8192)
@@ -144,6 +147,7 @@ def main():
         batch_size=args.batch_size,
         context_length=args.context_length,
         num_workers=args.num_workers,
+        max_tokens=args.max_tokens,
     )
 
     model = VeraceV1Model(config).to(args.device)
