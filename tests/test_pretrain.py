@@ -95,6 +95,46 @@ def test_save_and_load_checkpoint_roundtrip_preserves_model_and_optimizer_state(
     print("Checkpoint round trip preserved model and optimizer state.")
 
 
+def test_train_pretrain_step_clips_gradients_and_reports_grad_norm():
+    """
+    Regression test for a real training-divergence bug: an unclipped gradient spike
+    around step ~75 of a real pretraining run pushed a parameter's momentum buffer to
+    non-finite, which UnitaryMuon's momentum could never recover from afterward (see
+    test_unitary_muon.py's non-finite-gradient test for that half of the fix). This
+    tests the other half: train_pretrain_step must clip gradients to max_grad_norm
+    before the optimizer step, and report the (pre-clip) grad_norm via diagnostics so
+    spikes are visible in training logs rather than silently absorbed.
+    """
+    config = VeraceV1Config(
+        vocab_size=200, hidden_dim=32, num_layers=2, num_heads=2, head_dim=16,
+        spectral_dim=8, chams_holographic_dim=8, mcmoe_rank=4, mcmoe_num_components=4,
+        max_cognitive_depth=2, min_cognitive_depth=1
+    )
+    model = VeraceV1Model(config).cuda()
+    optimizer = build_hybrid_optimizer(model)
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 8), device="cuda")
+    batch = {"input_ids": input_ids, "labels": input_ids.clone()}
+
+    # An artificially tiny clip threshold against an otherwise perfectly normal, healthy
+    # batch/model -- any nonzero gradient exceeds it, so clipping reliably engages without
+    # needing to induce a real gradient spike (which risks tipping the model itself into
+    # non-finite territory and testing the *other* defense instead -- see
+    # test_unitary_muon.py's non-finite-gradient test for that one).
+    tiny_clip = 1e-4
+    diagnostics = {}
+    train_pretrain_step(model, optimizer, batch, use_amp=False, diagnostics=diagnostics, max_grad_norm=tiny_clip)
+
+    assert "grad_norm" in diagnostics
+    assert diagnostics["grad_norm"] > tiny_clip, "test setup should produce a nonzero grad norm the clip engages on"
+    total_norm_after_clip = torch.norm(
+        torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None])
+    ).item()
+    assert total_norm_after_clip <= tiny_clip * 1.01, f"gradients were not clipped to max_grad_norm={tiny_clip}: {total_norm_after_clip}"
+    print(f"Reported grad_norm={diagnostics['grad_norm']:.4f} (pre-clip), actual post-clip norm={total_norm_after_clip:.6f}.")
+
+
 if __name__ == "__main__":
     test_resumed_scheduler_matches_continuous_training_not_a_warmup_restart()
     test_save_and_load_checkpoint_roundtrip_preserves_model_and_optimizer_state()
+    test_train_pretrain_step_clips_gradients_and_reports_grad_norm()

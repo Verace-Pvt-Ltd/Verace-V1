@@ -204,14 +204,18 @@ def test_cham_triton_matches_live_eager_at_practical_lengths(s):
     torch.testing.assert_close(out_tri, out_eager.detach(), rtol=5e-2, atol=2e-2)
 
 
-def test_cham_eager_path_numerical_fragility_at_long_sequences_is_known():
-    """Documents a real finding, not a Triton bug: cham_memory.py's eager path builds the
-    raw (unretracted) prefix product via an O(log S) tree-structured associative scan in
-    fp32; at long sequences that scan's specific fp32 rounding diverges substantially from
-    a true (fp64) answer -- while both this repo's Triton kernel and a plain fp64
-    sequential reference track the true answer to ~1e-6 regardless of length. This test
-    pins down that gap so it is never silently forgotten or mistaken for a kernel
-    regression; it intentionally does NOT assert eager and Triton agree at s=100."""
+def test_cham_eager_path_matches_fp64_ground_truth_at_long_sequences():
+    """
+    cham_memory.py's parallel_newton_schulz_retraction had a real bug (not a numerical
+    precision limitation): it computed H_real's updated value, then reused that
+    already-updated H_real (instead of the pre-update value) to compute H_imag,
+    corrupting the complex multiplication on every iteration past the first. This
+    compounded over long sequences, previously producing >5e-3 error against a fp64
+    ground truth at s=100 here (formerly documented as "known eager-path fragility" --
+    it wasn't fragility, it was a wrong formula). Fixed by computing both outputs from
+    the same pre-update (H_real, H_imag) pair; the eager path now tracks fp64 ground
+    truth as tightly as the Triton kernel (which never had this bug) at long sequences.
+    """
     torch.manual_seed(7)
     b, s, holographic_dim, hidden_dim = 2, 100, 16, 32
     model = ContinuousHolographicMemory(hidden_dim=hidden_dim, holographic_dim=holographic_dim).cuda()
@@ -226,11 +230,7 @@ def test_cham_eager_path_numerical_fragility_at_long_sequences_is_known():
     eager_err = (out_eager.detach().double() - out_gold.double()).abs().max().item()
 
     assert tri_err < 1e-4, f"Triton should stay near fp64 ground truth at s={s}, got {tri_err:.2e}"
-    assert eager_err > 5e-3, (
-        "Eager's known long-sequence numerical fragility seems to have disappeared "
-        f"(err={eager_err:.2e}) -- if this now fails, re-verify before loosening it; "
-        "it existed as of this test's writing and is a property of cham_memory.py, not this file."
-    )
+    assert eager_err < 1e-4, f"Eager should now stay near fp64 ground truth at s={s} too, got {eager_err:.2e}"
 
 
 # =====================================================================

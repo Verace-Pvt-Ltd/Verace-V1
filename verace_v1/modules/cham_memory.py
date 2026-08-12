@@ -35,8 +35,16 @@ def newton_schulz_unitary_retraction(H_real: torch.Tensor, H_imag: torch.Tensor,
 
         # H_next = 0.5 * H * (3 * I - H^H * H)
         # = 0.5 * (H_r + i*H_i) * (diff_r + i*diff_i)
-        H_real = 0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i))
-        H_imag = 0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r))
+        # Both outputs need the SAME pre-update (H_real, H_imag) -- computing H_real's
+        # new value first and reusing the variable name for H_imag's computation (as an
+        # earlier version of this code did) silently feeds the already-updated H_real
+        # into H_imag's formula instead of the original, corrupting the complex
+        # multiplication on every iteration past the first. Real bug, not just numerical
+        # sensitivity: this is why the iteration could occasionally diverge to NaN/Inf
+        # for inputs that are otherwise perfectly well-conditioned.
+        H_real_next = 0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i))
+        H_imag_next = 0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r))
+        H_real, H_imag = H_real_next, H_imag_next
 
     return H_real, H_imag
 
@@ -208,7 +216,11 @@ def parallel_newton_schulz_retraction(H_real: torch.Tensor, H_imag: torch.Tensor
         diff_r = 3.0 * eye - HH_r
         diff_i = -HH_i
 
-        H_real = 0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i))
-        H_imag = 0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r))
+        # See newton_schulz_unitary_retraction's comment above: both outputs need the
+        # same pre-update (H_real, H_imag) pair, so compute both into temporaries before
+        # reassigning either.
+        H_real_next = 0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i))
+        H_imag_next = 0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r))
+        H_real, H_imag = H_real_next, H_imag_next
 
     return H_real, H_imag

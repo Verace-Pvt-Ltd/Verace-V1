@@ -66,6 +66,45 @@ def test_cham_unitary_retraction_holds_under_cuda_bf16_autocast():
     assert diff < 1e-3, f"CHAM hologram is not unitary under CUDA bf16 autocast: ||H^H * H - I|| = {diff:.6f}"
     print(f"CHAM unitary constraint under CUDA bf16 autocast verified. ||H^H * H - I|| = {diff:.6f}")
 
+def test_newton_schulz_retraction_matches_correct_complex_multiplication():
+    """
+    Regression test for a real bug: the retraction loop computed H_real's updated value,
+    then reused that already-updated H_real (instead of the pre-update value) when
+    computing H_imag, corrupting the complex multiplication H_next = 0.5*H*(3I - H^H H)
+    on every iteration past the first. This compares against a reference that evaluates
+    both outputs from the same pre-update (H_real, H_imag) pair via Python tuple
+    assignment (which evaluates the whole right-hand side before rebinding either name --
+    the correct pattern the fix now uses too).
+    """
+    torch.manual_seed(0)
+    d = 16
+    H_real = torch.randn(2, d, d, device="cuda") * 0.1 + torch.eye(d, device="cuda")
+    H_imag = torch.randn(2, d, d, device="cuda") * 0.1
+    eye = torch.eye(d, device="cuda").unsqueeze(0)
+
+    def reference_retraction(H_real, H_imag, steps=3):
+        for _ in range(steps):
+            HH_r = torch.matmul(H_real.transpose(-1, -2), H_real) + torch.matmul(H_imag.transpose(-1, -2), H_imag)
+            HH_i = torch.matmul(H_real.transpose(-1, -2), H_imag) - torch.matmul(H_imag.transpose(-1, -2), H_real)
+            diff_r = 3.0 * eye - HH_r
+            diff_i = -HH_i
+            # Tuple assignment: Python evaluates the full RHS (using the pre-update
+            # H_real/H_imag for BOTH expressions) before rebinding either name.
+            H_real, H_imag = (
+                0.5 * (torch.matmul(H_real, diff_r) - torch.matmul(H_imag, diff_i)),
+                0.5 * (torch.matmul(H_real, diff_i) + torch.matmul(H_imag, diff_r)),
+            )
+        return H_real, H_imag
+
+    got_r, got_i = newton_schulz_unitary_retraction(H_real.clone(), H_imag.clone())
+    expected_r, expected_i = reference_retraction(H_real.clone(), H_imag.clone())
+
+    torch.testing.assert_close(got_r, expected_r, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(got_i, expected_i, rtol=1e-5, atol=1e-6)
+    print("newton_schulz_unitary_retraction matches the correct (pre-update-consistent) complex multiplication.")
+
+
 if __name__ == "__main__":
     test_cham_unitary_retraction()
     test_cham_unitary_retraction_holds_under_cuda_bf16_autocast()
+    test_newton_schulz_retraction_matches_correct_complex_multiplication()

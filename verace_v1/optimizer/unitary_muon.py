@@ -8,6 +8,7 @@ first here and found to enter a persistent oscillation (never converging) for ma
 with small singular values, which is the common case for real weight-matrix gradients.
 """
 
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -55,10 +56,38 @@ def stiefel_orthogonalize(G: torch.Tensor, steps: int = 5, tol: float = 1e-2) ->
 
         if dev < tol:
             return X_scaled.to(G.dtype)
+    else:
+        X_scaled = X  # near-zero gradient: nothing to orthogonalize, but still need a fallback value below
 
-    # Exact SVD fallback for pathologically ill-conditioned matrices
-    U, _, Vh = torch.linalg.svd(X, full_matrices=False)
-    return (U @ Vh).to(G.dtype)
+    # Exact SVD fallback for pathologically ill-conditioned matrices. cusolver's batched
+    # GPU driver can itself fail to converge on sufficiently degenerate matrices (seen in
+    # practice: "algorithm failed to converge... input matrix is ill-conditioned or has
+    # too many repeated singular values") -- letting that propagate unhandled crashes the
+    # entire training run over a single pathological parameter update. Retry on CPU first
+    # (LAPACK's SVD is generally more numerically robust than cusolver for these cases);
+    # only if that *also* fails do we accept the un-converged Newton-Schulz iterate rather
+    # than crash -- logged loudly either way, never silent.
+    try:
+        U, _, Vh = torch.linalg.svd(X, full_matrices=False)
+        return (U @ Vh).to(G.dtype)
+    except torch._C._LinAlgError as e:
+        try:
+            U, _, Vh = torch.linalg.svd(X.cpu(), full_matrices=False)
+            warnings.warn(
+                f"stiefel_orthogonalize: GPU SVD failed to converge ({e}); CPU SVD "
+                f"retry succeeded for a {tuple(G.shape)} matrix.",
+                stacklevel=2
+            )
+            return (U @ Vh).to(G.dtype).to(G.device)
+        except torch._C._LinAlgError as e2:
+            warnings.warn(
+                f"stiefel_orthogonalize: SVD failed to converge on both GPU and CPU "
+                f"({e2}) for a {tuple(G.shape)} matrix -- falling back to the "
+                f"un-converged Newton-Schulz iterate (deviation from orthogonal not "
+                f"guaranteed < tol this step) rather than crashing the training run.",
+                stacklevel=2
+            )
+            return X_scaled.to(G.dtype)
 
 
 class UnitaryMuon(Optimizer):
@@ -100,6 +129,26 @@ class UnitaryMuon(Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(p.data)
 
                 buf = state["momentum_buffer"]
+
+                # Defense in depth: a non-finite gradient must never enter the momentum
+                # buffer. buf.mul_(momentum) can never clear a NaN/Inf once absorbed (NaN
+                # times anything is still NaN), so every future step would silently stay
+                # corrupted forever -- observed in practice: a single bad batch produced a
+                # NaN gradient, momentum absorbed it, and the (necessarily NaN-in-NaN-out)
+                # orthogonalization fallback had no way to recover a meaningful update
+                # from an already-NaN input. Skipping this parameter's update for one step
+                # (leaving its momentum untouched) is far safer than corrupting it, and
+                # gradient clipping upstream (see train_pretrain_step) is what should keep
+                # this rare in the first place.
+                if not torch.isfinite(grad).all():
+                    warnings.warn(
+                        f"UnitaryMuon: non-finite gradient for a {tuple(p.shape)} parameter "
+                        f"-- skipping this step's update for it (momentum buffer left "
+                        f"untouched) rather than corrupting momentum permanently.",
+                        stacklevel=2
+                    )
+                    continue
+
                 buf.mul_(momentum).add_(grad)
 
                 if p.ndim == 2:

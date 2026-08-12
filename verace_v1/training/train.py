@@ -8,6 +8,15 @@ logs loss/depth/throughput, and checkpoints periodically with resume support.
 Model defaults are sized for a single ~6GB-VRAM GPU, not for a
 production-scale run -- override every dimension via CLI flags once the
 pilot proves the architecture trains, to scale up on bigger hardware.
+
+Sizing note: CHAM's training-time (eager, autograd-tracked) path holds a full
+[batch, seq_len, holographic_dim, holographic_dim] activation tensor per layer for
+backward -- memory scales with batch_size * context_length * holographic_dim^2,
+independent of parameter count. The defaults below (context_length=128,
+chams_holographic_dim=64, batch_size=2) were empirically verified (not guessed) to
+peak at ~3.7GB on a 6GB GPU across multiple batches with varying ACD halting-depth
+distributions, leaving real headroom -- not just the tightest config that happens
+not to crash on one sample batch.
 """
 import argparse
 import json
@@ -18,10 +27,11 @@ from dataclasses import dataclass
 import torch
 
 from verace_v1.config import VeraceV1Config
-from verace_v1.dataset.dataset import create_pretrain_dataloader
+from verace_v1.dataset.dataset import create_pretrain_dataloader, resolve_corpus_files
 from verace_v1.modules.backbone import VeraceV1Model
 from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer
 from verace_v1.tokenizer import VeraceTokenizer
+from verace_v1.tokenizer.gpt_neo_top10k import build_gpt_neo_top10k_tokenizer, VOCAB_SIZE as GPT_NEO_TOP10K_VOCAB_SIZE
 from verace_v1.training.diagnostics import CHAMInvariantProbe
 from verace_v1.training.pretrain import (
     get_cosine_schedule_with_warmup,
@@ -50,12 +60,18 @@ def parse_args() -> argparse.Namespace:
                     help="Path to a .txt/.jsonl file or a directory of them. "
                          "Omit to use the synthetic fallback (NOT real training -- "
                          "only useful for smoke-testing the pipeline).")
-    p.add_argument("--context_length", type=int, default=512)
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--context_length", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--max_tokens", type=int, default=None,
                     help="Cap on tokens read from --data_path (stops reading/tokenizing "
                          "once reached). Omit to use the whole corpus.")
+    p.add_argument("--tokenizer", type=str, default="moonshot", choices=["moonshot", "gpt_neo_top10k"],
+                    help="'moonshot' (default): Verace's own vendored Kimi K3 tokenizer. "
+                         "'gpt_neo_top10k': GPT-Neo's BPE tokenizer restricted to its 10,000 "
+                         "most frequent tokens in --data_path -- matches the TinyStories paper "
+                         "(arXiv:2305.07759) exactly, for apples-to-apples loss/perplexity "
+                         "comparison against its published numbers. Forces --vocab_size=10000.")
 
     # Model -- pilot-scale defaults sized for a single ~6GB GPU
     p.add_argument("--vocab_size", type=int, default=8192)
@@ -64,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_heads", type=int, default=4)
     p.add_argument("--head_dim", type=int, default=64)
     p.add_argument("--spectral_dim", type=int, default=64)
-    p.add_argument("--chams_holographic_dim", type=int, default=128)
+    p.add_argument("--chams_holographic_dim", type=int, default=64)
     p.add_argument("--mcmoe_rank", type=int, default=16)
     p.add_argument("--mcmoe_num_components", type=int, default=16)
     p.add_argument("--max_cognitive_depth", type=int, default=6)
@@ -79,6 +95,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_steps", type=int, default=20)
     p.add_argument("--depth_penalty_weight", type=float, default=0.001)
     p.add_argument("--energy_penalty_weight", type=float, default=0.01)
+    p.add_argument("--max_grad_norm", type=float, default=1.0,
+                    help="Global gradient norm clip before each optimizer step -- without "
+                         "this, an occasional gradient spike can permanently corrupt "
+                         "UnitaryMuon's momentum (see train_pretrain_step's docstring).")
     p.add_argument("--amp", dest="use_amp", action="store_true", default=True)
     p.add_argument("--no_amp", dest="use_amp", action="store_false")
 
@@ -118,8 +138,22 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
+    if args.data_path is None:
+        print("[Verace V1 Pretrain] WARNING: no --data_path given -- training on the "
+              "synthetic fallback corpus. This proves the pipeline runs, NOT that the "
+              "model learns anything. Pass --data_path to a real .txt/.jsonl file or "
+              "directory for an actual pretraining pilot.")
+
+    vocab_size = args.vocab_size
+    if args.tokenizer == "gpt_neo_top10k":
+        if args.vocab_size != GPT_NEO_TOP10K_VOCAB_SIZE:
+            print(f"[Verace V1 Pretrain] --tokenizer gpt_neo_top10k forces "
+                  f"vocab_size={GPT_NEO_TOP10K_VOCAB_SIZE} (--vocab_size={args.vocab_size} ignored) "
+                  f"-- compressed token ids only range 0..{GPT_NEO_TOP10K_VOCAB_SIZE - 1}.")
+        vocab_size = GPT_NEO_TOP10K_VOCAB_SIZE
+
     config = VeraceV1Config(
-        vocab_size=args.vocab_size,
+        vocab_size=vocab_size,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
@@ -133,13 +167,16 @@ def main():
         vision_config=PilotVisionConfig(),
     )
 
-    tokenizer = VeraceTokenizer(vocab_size=config.vocab_size)
-
-    if args.data_path is None:
-        print("[Verace V1 Pretrain] WARNING: no --data_path given -- training on the "
-              "synthetic fallback corpus. This proves the pipeline runs, NOT that the "
-              "model learns anything. Pass --data_path to a real .txt/.jsonl file or "
-              "directory for an actual pretraining pilot.")
+    if args.tokenizer == "gpt_neo_top10k":
+        files = resolve_corpus_files(args.data_path)
+        if not files:
+            raise ValueError("--tokenizer gpt_neo_top10k requires a real --data_path (frequency "
+                              "ranking needs an actual corpus to scan) -- the synthetic fallback isn't supported.")
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(files[0])), ".verace_token_cache")
+        print(f"[Verace V1 Pretrain] Building/loading GPT-Neo top-10K frequency ranking from {files}...")
+        tokenizer = build_gpt_neo_top10k_tokenizer(files, cache_dir)
+    else:
+        tokenizer = VeraceTokenizer(vocab_size=config.vocab_size)
 
     dataloader = create_pretrain_dataloader(
         data_path=args.data_path,
@@ -210,6 +247,7 @@ def main():
                 energy_penalty_weight=args.energy_penalty_weight,
                 use_amp=args.use_amp and args.device == "cuda",
                 diagnostics=diagnostics,
+                max_grad_norm=args.max_grad_norm,
             )
             cham_deviation = cham_probe.pop_mean_deviation()
             muon_scheduler.step()
@@ -228,6 +266,7 @@ def main():
                       f"(std={diagnostics.get('depth_std', 0.0):.2f}, "
                       f"range=[{diagnostics.get('depth_min', 0):.0f},{diagnostics.get('depth_max', 0):.0f}])"
                       f"/{config.num_layers} cham_dev={cham_str} "
+                      f"grad_norm={diagnostics.get('grad_norm', float('nan')):.3f} "
                       f"muon_lr={muon_lr:.2e} adamw_lr={adamw_lr:.2e} {avg_ms:.0f}ms/step")
 
                 log_record = {

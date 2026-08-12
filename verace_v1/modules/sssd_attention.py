@@ -5,6 +5,8 @@ Uses Cayley Transform R_t = (I - 0.5 * delta * A)^{-1} (I + 0.5 * delta * A) whe
 strictly conserving state norm and energy over infinite sequence horizons: ||Psi_t|| = ||Psi_0||.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +16,61 @@ try:
     from verace_v1.serving.triton_kernels import HAS_TRITON
 except ImportError:
     HAS_TRITON = False
+
+
+def _solve_cayley(right: torch.Tensor, left: torch.Tensor, eye: torch.Tensor) -> torch.Tensor:
+    """
+    Solves right @ R = left for R (the Cayley transform R_t = (I-0.5*delta*A)^-1(I+0.5*delta*A)).
+    `right` is provably non-singular in exact arithmetic (its eigenvalues are 1 + 0.5*delta*i*mu
+    for skew-symmetric A's purely-imaginary eigenvalues i*mu, so the real part is always exactly
+    1) -- but cusolver's batched GPU LU solve can still occasionally return non-finite output for
+    a batch of many small matrices (same class of driver edge case observed in
+    stiefel_orthogonalize's SVD fallback; see verace_v1/optimizer/unitary_muon.py). A single such
+    failure previously produced a hard, instant jump from healthy to fully-NaN hidden states mid
+    -training with no gradual warning.
+
+    Patching only the forward *output* of a bad solve (e.g. torch.where'ing in a safe value
+    after the fact) is NOT sufficient: autograd differentiates the original solve node
+    regardless of what happens to its output downstream, and torch.linalg.solve's backward is
+    itself an independent adjoint solve that reuses the (already non-finite) primal result --
+    so NaN leaks straight into d(loss)/d(right) and d(loss)/d(left) even when every consumer of
+    the forward value only ever sees the cleaned-up output. (Confirmed directly: a near-singular
+    `right` produces a NaN gradient on `right` even after fully replacing the forward output with
+    a clean value via torch.where -- same class of bug as torch.norm's gradient at zero, one level
+    removed.) The only robust fix is to substitute the *input* for the affected positions before
+    solving at all, with a trivially well-conditioned pair (right=I, left=I => R=I, matching what
+    R_t already reduces to when delta=0) so torch.linalg.solve's backward never touches whatever
+    made the original matrix numerically pathological, for either the forward or the backward pass.
+    """
+    with torch.no_grad():
+        probe = torch.linalg.solve(right, left)
+        bad = ~torch.isfinite(probe)
+
+    if not bad.any():
+        return torch.linalg.solve(right, left)
+
+    warnings.warn(
+        f"SSSD: torch.linalg.solve returned non-finite values for {bad.any(dim=(-1, -2)).sum().item()} "
+        f"of {right.shape[:-2].numel()} matrices (GPU solver edge case) -- substituting a "
+        f"well-conditioned identity pair for those positions' INPUT (right=I, left=I => R=I, "
+        f"equivalent to delta=0) and re-solving, so neither the forward value nor the gradient "
+        f"ever touches the pathological matrix.",
+        stacklevel=2
+    )
+    bad_matrix = bad.any(dim=-1, keepdim=True).any(dim=-2, keepdim=True).expand_as(right)
+    safe_right = torch.where(bad_matrix, eye.expand_as(right), right)
+    safe_left = torch.where(bad_matrix, eye.expand_as(left), left)
+    R_seq = torch.linalg.solve(safe_right, safe_left)
+
+    if not torch.isfinite(R_seq).all():
+        warnings.warn(
+            "SSSD: torch.linalg.solve still produced non-finite output after input "
+            "substitution -- forcing remaining non-finite entries to 0 as a last resort.",
+            stacklevel=2
+        )
+        R_seq = torch.nan_to_num(R_seq, nan=0.0, posinf=0.0, neginf=0.0)
+    return R_seq
+
 
 class SSSDAttention(nn.Module):
     """
@@ -106,7 +163,7 @@ class SSSDAttention(nn.Module):
             scale_A = 0.5 * d_seq * A_seq
             left = eye - scale_A
             right = eye + scale_A
-            R_seq = torch.linalg.solve(right, left) # [b, h, s, d_k, d_k] Exact Orthogonal R_t
+            R_seq = _solve_cayley(right, left, eye) # [b, h, s, d_k, d_k] Exact Orthogonal R_t
 
             # 2. Logarithmic O(log2 S) Associative Parallel Prefix Scan over matrix multiplications
             P_seq = parallel_prefix_scan(R_seq) # [b, h, s, d_k, d_k] P_t = R_t * R_{t-1} * ... * R_1

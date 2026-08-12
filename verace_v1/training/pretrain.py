@@ -115,7 +115,8 @@ def train_pretrain_step(
     depth_penalty_weight: float = 0.001,
     energy_penalty_weight: float = 0.01,
     use_amp: bool = True,
-    diagnostics: Optional[Dict] = None
+    diagnostics: Optional[Dict] = None,
+    max_grad_norm: float = 1.0
 ) -> Tuple[float, float]:
     """
     Production pre-training step minimizing:
@@ -123,9 +124,21 @@ def train_pretrain_step(
                 + energy_penalty_weight * mean(E(h_{t-1}, h_t))
     Supports AMP bfloat16 mixed precision.
 
+    Gradients are clipped to global norm `max_grad_norm` before the optimizer step --
+    without this, an occasional large-but-finite gradient spike can push some parameter's
+    momentum buffer into overflow (observed in practice, ~75 steps into a real pretraining
+    run: loss was decreasing cleanly, then a spike produced a non-finite gradient that
+    UnitaryMuon's momentum has no way to recover from once absorbed -- see
+    verace_v1/optimizer/unitary_muon.py's non-finite-gradient guard, which is a second,
+    independent line of defense for the residual case clipping alone can't fix: clipping
+    rescales by a gradient norm that is itself NaN if any element already is, so it cannot
+    rescue a gradient that's already non-finite, only prevent finite-but-huge ones from
+    becoming that.
+
     Pass a dict via `diagnostics` to have it populated in-place with
-    depth_distribution_stats(depth_counts) (see verace_v1/training/diagnostics.py)
-    -- purely additive, existing callers that don't pass it see no change.
+    depth_distribution_stats(depth_counts) (see verace_v1/training/diagnostics.py) and
+    grad_norm (pre-clip global gradient norm) -- purely additive, existing callers that
+    don't pass it see no change.
     """
     model.train()
     optimizer.zero_grad()
@@ -167,6 +180,9 @@ def train_pretrain_step(
         diagnostics.update(depth_distribution_stats(depth_counts))
 
     total_loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    if diagnostics is not None:
+        diagnostics["grad_norm"] = grad_norm.item()
     optimizer.step()
 
     return ce_loss.item(), torch.mean(depth_counts.float()).item()

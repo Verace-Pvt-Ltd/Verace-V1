@@ -1,7 +1,10 @@
 """
 Unit tests for UnitaryMuon's Stiefel-manifold orthogonalization across matrix shapes.
 """
+import warnings
+
 import torch
+import verace_v1.optimizer.unitary_muon as unitary_muon_mod
 from verace_v1.config import VeraceV1Config
 from verace_v1.modules.backbone import VeraceV1Model
 from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer, stiefel_orthogonalize, UnitaryMuon
@@ -50,6 +53,99 @@ def test_unitary_muon_step_runs_on_rectangular_params():
 
     assert not torch.isnan(linear.weight).any()
     print("UnitaryMuon.step() on a rectangular (128, 32) parameter completed cleanly.")
+
+
+def test_unitary_muon_skips_update_and_preserves_momentum_on_nonfinite_gradient():
+    """
+    Regression test for a real training-divergence bug: a NaN gradient (from an
+    upstream numerical spike) got absorbed into the momentum buffer
+    (buf.mul_(momentum).add_(grad)), which can never recover once poisoned -- NaN times
+    anything is still NaN, so every subsequent step stayed corrupted forever, and the
+    orthogonalization fallback had no way to produce a meaningful update from an
+    already-NaN input. The fix: detect a non-finite gradient before it touches momentum
+    and skip that parameter's update for the step, leaving momentum untouched.
+    """
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(16, 32, bias=False).cuda()
+    optimizer = UnitaryMuon(linear.parameters(), lr=0.01, momentum=0.9)
+
+    # Healthy step first, to give momentum a real (non-zero) value to protect.
+    x = torch.randn(4, 16, device="cuda")
+    linear(x).sum().backward()
+    optimizer.step()
+    momentum_before = optimizer.state[linear.weight]["momentum_buffer"].clone()
+    weight_before = linear.weight.clone()
+    assert not torch.isnan(momentum_before).any()
+
+    # Now a NaN gradient (e.g. from an upstream numerical explosion).
+    linear.weight.grad = torch.full_like(linear.weight, float("nan"))
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        optimizer.step()
+        assert any("non-finite gradient" in str(warning.message) for warning in w)
+
+    momentum_after = optimizer.state[linear.weight]["momentum_buffer"]
+    assert torch.equal(momentum_before, momentum_after), "momentum buffer must be untouched by a non-finite gradient"
+    assert torch.equal(weight_before, linear.weight), "parameter must be untouched when its gradient is non-finite"
+    print("UnitaryMuon correctly skipped the update and preserved momentum on a NaN gradient.")
+
+
+def test_stiefel_orthogonalize_recovers_from_gpu_svd_convergence_failure(monkeypatch):
+    """
+    Regression test for a real crash observed during a pilot run: cusolver's batched GPU
+    SVD driver raised torch._C._LinAlgError ("algorithm failed to converge... too many
+    repeated singular values") inside the SVD fallback path, and it was unhandled --
+    crashing the entire training run on a single pathological parameter update. The fix
+    retries on CPU (generally more numerically robust); this test forces the GPU call to
+    fail and the CPU retry to succeed, and asserts a warning is raised but no exception
+    propagates.
+    """
+    real_svd = torch.linalg.svd
+
+    def flaky_svd(X, *args, **kwargs):
+        if X.is_cuda:
+            raise torch._C._LinAlgError("simulated cusolver convergence failure")
+        return real_svd(X, *args, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "svd", flaky_svd)
+
+    # A matrix pathological enough that Newton-Schulz won't hit `dev < tol` either,
+    # forcing the SVD fallback path to actually run.
+    G = torch.zeros(32, 16, device="cuda")
+    G[0, 0] = 1e-8
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = stiefel_orthogonalize(G)
+        assert any("CPU SVD retry succeeded" in str(warning.message) for warning in w)
+
+    assert result.shape == G.shape
+    assert not torch.isnan(result).any()
+    print("stiefel_orthogonalize recovered from a simulated GPU SVD failure via CPU retry.")
+
+
+def test_stiefel_orthogonalize_falls_back_to_newton_schulz_iterate_if_svd_fails_everywhere(monkeypatch):
+    """When SVD fails on both GPU and CPU, the function must return the (imperfectly
+    orthogonal) Newton-Schulz iterate rather than crash -- verified here by forcing both
+    calls to fail."""
+    def always_fails(X, *args, **kwargs):
+        raise torch._C._LinAlgError("simulated total SVD failure")
+
+    monkeypatch.setattr(torch.linalg, "svd", always_fails)
+
+    G = torch.zeros(32, 16, device="cuda")
+    G[0, 0] = 1e-8
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = stiefel_orthogonalize(G)
+        assert any("falling back to the un-converged Newton-Schulz iterate" in str(warning.message) for warning in w)
+
+    assert result.shape == G.shape
+    assert not torch.isnan(result).any()
+    print("stiefel_orthogonalize returned the Newton-Schulz iterate instead of crashing when SVD failed everywhere.")
+
 
 def test_build_hybrid_optimizer_excludes_tied_embedding_and_1d_params_from_muon():
     """

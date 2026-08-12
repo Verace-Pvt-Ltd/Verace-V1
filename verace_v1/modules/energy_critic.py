@@ -28,7 +28,13 @@ class LatentEnergyCritic(nn.Module):
         """
         proj_x = self.w_energy(x_prompt).unsqueeze(1) # [b, 1, s, d]
         diff = h_cand - proj_x # [b, branches, s, d]
-        energy_tokens = torch.norm(diff, dim=-1)**2 # [b, branches, s]
+        # ||diff||^2 computed directly as sum(diff^2), NOT torch.norm(diff)**2: norm()'s
+        # gradient is diff/||diff||, which is 0/0 = NaN whenever diff is exactly (or
+        # numerically very close to) zero -- observed in practice during real training,
+        # ~95 steps in, once a candidate's predicted state started closely matching the
+        # target. Mathematically identical forward value, but sum-of-squares has a
+        # gradient (2*diff) that's well-defined everywhere, including at diff=0.
+        energy_tokens = (diff ** 2).sum(dim=-1) # [b, branches, s]
         energy_score = torch.mean(energy_tokens, dim=-1) # [b, branches]
         return energy_score
 
