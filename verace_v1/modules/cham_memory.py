@@ -90,36 +90,47 @@ class ContinuousHolographicMemory(nn.Module):
             return y, (H_real, H_imag)
 
         # O(log S) Associative Parallel Prefix Scan Path
-        if initial_hologram is not None:
-            H_r_0, H_i_0 = initial_hologram
-        else:
-            eye = torch.eye(self.holographic_dim, device=x.device, dtype=x.dtype).unsqueeze(0).repeat(b, 1, 1)
-            H_r_0 = eye
-            H_i_0 = torch.zeros_like(eye)
+        # Forced to fp32 with autocast disabled: this path's entire purpose is an exact
+        # unitary guarantee (H^H H = I held to floating-point precision), which bf16's
+        # ~3 decimal digits cannot hold, and under active autocast the eye/eye_seq
+        # tensors (built from x.dtype, still fp32 pre-autocast) mix with q/k/v/gamma
+        # (already cast to bf16 by the Linear layers above), producing a dtype
+        # mismatch on the parallel scan's in-place writes.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            q32, k32, v32, gamma32 = q.float(), k.float(), v.float(), gamma.float()
 
-        kt_col = k.unsqueeze(-1) # [b, s, h_dim, 1]
-        vt_row = v.unsqueeze(-2) # [b, s, 1, h_dim]
-        kv_seq = torch.matmul(kt_col, vt_row) # [b, s, h_dim, h_dim]
+            if initial_hologram is not None:
+                H_r_0, H_i_0 = initial_hologram
+                H_r_0, H_i_0 = H_r_0.float(), H_i_0.float()
+            else:
+                eye = torch.eye(self.holographic_dim, device=x.device, dtype=torch.float32).unsqueeze(0).repeat(b, 1, 1)
+                H_r_0 = eye
+                H_i_0 = torch.zeros_like(eye)
 
-        eye_seq = torch.eye(self.holographic_dim, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
-        g_seq = gamma.unsqueeze(-1)
+            kt_col = k32.unsqueeze(-1) # [b, s, h_dim, 1]
+            vt_row = v32.unsqueeze(-2) # [b, s, 1, h_dim]
+            kv_seq = torch.matmul(kt_col, vt_row) # [b, s, h_dim, h_dim]
 
-        # Infinitesimal Unitary Transformation sequence: U_t = I + i * g_t * (k_t v_t^T)
-        U_r_seq = eye_seq.repeat(b, s, 1, 1)
-        U_i_seq = g_seq * kv_seq # [b, s, h_dim, h_dim]
+            eye_seq = torch.eye(self.holographic_dim, device=x.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            g_seq = gamma32.unsqueeze(-1)
 
-        # Logarithmic O(log2 S) Associative Parallel Prefix Scan over complex matrix sequence
-        P_r_seq, P_i_seq = parallel_complex_prefix_scan(U_r_seq, U_i_seq)
+            # Infinitesimal Unitary Transformation sequence: U_t = I + i * g_t * (k_t v_t^T)
+            U_r_seq = eye_seq.repeat(b, s, 1, 1)
+            U_i_seq = g_seq * kv_seq # [b, s, h_dim, h_dim]
 
-        # Compute prefix holograms H_t = H_0 * P_t
-        H_r_seq = torch.matmul(H_r_0.unsqueeze(1), P_r_seq) - torch.matmul(H_i_0.unsqueeze(1), P_i_seq)
-        H_i_seq = torch.matmul(H_r_0.unsqueeze(1), P_i_seq) + torch.matmul(H_i_0.unsqueeze(1), P_r_seq)
+            # Logarithmic O(log2 S) Associative Parallel Prefix Scan over complex matrix sequence
+            P_r_seq, P_i_seq = parallel_complex_prefix_scan(U_r_seq, U_i_seq)
 
-        # Parallel Newton-Schulz Unitary Retraction across all sequence positions
-        H_r_seq, H_i_seq = parallel_newton_schulz_retraction(H_r_seq, H_i_seq, steps=3)
+            # Compute prefix holograms H_t = H_0 * P_t
+            H_r_seq = torch.matmul(H_r_0.unsqueeze(1), P_r_seq) - torch.matmul(H_i_0.unsqueeze(1), P_i_seq)
+            H_i_seq = torch.matmul(H_r_0.unsqueeze(1), P_i_seq) + torch.matmul(H_i_0.unsqueeze(1), P_r_seq)
 
-        # Holographic Recall: Re(H_t * q_t) across all positions in parallel
-        rec_seq = torch.matmul(H_r_seq, q.unsqueeze(-1)).squeeze(-1) # [b, s, h_dim]
+            # Parallel Newton-Schulz Unitary Retraction across all sequence positions
+            H_r_seq, H_i_seq = parallel_newton_schulz_retraction(H_r_seq, H_i_seq, steps=3)
+
+            # Holographic Recall: Re(H_t * q_t) across all positions in parallel
+            rec_seq = torch.matmul(H_r_seq, q32.unsqueeze(-1)).squeeze(-1) # [b, s, h_dim]
+
         y = self.norm(self.w_out(rec_seq))
 
         return y, (H_r_seq[:, -1], H_i_seq[:, -1])

@@ -37,12 +37,15 @@ cannot change its Frobenius norm, so:
 ```
 
 `delta_t` (from `w_delta`, scaled to `[0, 0.1]` via sigmoid) controls how much
-each step's key/value pair rotates the state; `omega` (from `w_omega`) is
-generated but the Cayley-transform path (the default, CPU/GPU-agnostic
-PyTorch path) derives rotation directly from `A_t` rather than from `omega`.
-The Triton kernel path (see
-[../serving/triton-kernels.md](../serving/triton-kernels.md)) uses a
-mathematically equivalent complex-phase formulation driven by `omega`.
+each step's key/value pair rotates the state. An earlier prototype derived
+this rotation from a learned per-head phase frequency `omega` (elementwise
+complex rotation, `Psi_rot = e^{i*omega_t} * Psi`); that was superseded by
+the content-derived skew-symmetric generator `A_t` above, which gives an
+exact `R_t^T R_t = I` guarantee over the full state matrix rather than a
+per-element unit-modulus one. Both the Cayley-transform PyTorch path and the
+Triton kernel path (see
+[../serving/triton-kernels.md](../serving/triton-kernels.md)) derive
+rotation from `A_t`; there is no `omega`/phase-based path in this module.
 
 ## Halted Tokens
 
@@ -91,7 +94,7 @@ Per-timestep recurrence (repeated for `t = 1..seq_len`, one state `Psi` per head
 
 ```mermaid
 flowchart LR
-    XT["x_t"] --> PROJ["W_q, W_k, W_v, W_omega, W_delta"]
+    XT["x_t"] --> PROJ["W_q, W_k, W_v, W_delta"]
     PROJ --> A["A_t = k_t v_t^T - v_t k_t^T\n(skew-symmetric)"]
     A --> CAYLEY["Cayley transform\nR_t = (I - 0.5 delta_t A_t)^-1 (I + 0.5 delta_t A_t)\nR_t^T R_t = I (exact)"]
     PSIPREV["Psi_(t-1)"] --> ROTATE(("x"))

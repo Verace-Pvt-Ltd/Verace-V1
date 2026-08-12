@@ -27,12 +27,12 @@ def test_acd_batch_independence_and_flop_shrinkage():
         min_cognitive_depth=1
     )
 
-    model = VeraceV1Model(config)
+    model = VeraceV1Model(config).cuda()
     model.eval()
 
-    item_A = torch.randint(0, config.vocab_size, (1, 8))
-    item_B = torch.randint(0, config.vocab_size, (1, 8))
-    item_C = torch.randint(0, config.vocab_size, (1, 8))
+    item_A = torch.randint(0, config.vocab_size, (1, 8), device="cuda")
+    item_B = torch.randint(0, config.vocab_size, (1, 8), device="cuda")
+    item_C = torch.randint(0, config.vocab_size, (1, 8), device="cuda")
 
     batch_AB = torch.cat([item_A, item_B], dim=0)
     batch_AC = torch.cat([item_A, item_C], dim=0)
@@ -47,10 +47,10 @@ def test_acd_batch_independence_and_flop_shrinkage():
     print(f"Batch independence verified. Item A max diff: {diff:.8f}")
 
     # 2. Verify per-example token gathering under early halting
-    engine = AdaptiveCognitiveDepthEngine(hidden_dim=64, energy_threshold=0.001) # Force early halting
+    engine = AdaptiveCognitiveDepthEngine(hidden_dim=64, energy_threshold=0.001).cuda() # Force early halting
     layers = model.layers
 
-    h_in = torch.randn(2, 8, 64)
+    h_in = torch.randn(2, 8, 64, device="cuda")
     final_h, depths = engine.execute_adaptive_recurrent_loop(layers, h_in, max_depth=4, min_depth=1)
 
     print(f"Per-example gathering verified. Mean cognitive depth: {depths.float().mean():.2f}")

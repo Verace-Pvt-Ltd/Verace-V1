@@ -1,6 +1,6 @@
 # Triton GPU Kernels
 
-**Modules:** `verace_v1/serving/triton_kernels.py`, `verace_v1/serving/sssd_triton.py`
+**Module:** `verace_v1/serving/triton_kernels.py`
 
 Fused Triton GPU kernels for the three modules that have both a PyTorch
 fallback path and a GPU-fused path. These kernels require a CUDA device;
@@ -13,28 +13,17 @@ caller-side code changes are needed to use the GPU path.
 
 ## `HAS_TRITON`
 
-`True` if `triton` is importable, `False` otherwise (both files degrade
-gracefully via `try/except ImportError`). Every module that imports Triton
-kernels does so through this flag, so the package works without Triton
-installed — you just don't get the fused GPU path.
-
-## `sssd_triton.py`
-
-| Symbol | Purpose |
-| :--- | :--- |
-| `sssd_spectral_recurrence_kernel` | Fused per-step complex unitary phase recurrence: `Psi_next = R(omega) * Psi + delta * (k ⊗ v)`, read as `Re(Psi_next) * q` |
-| `run_sssd_triton_step` | Python launcher for the kernel above |
-
-This is a complex-phase-rotation formulation of the same update SSSD's
-PyTorch path computes via an explicit Cayley transform — see
-[../modules/sssd-attention.md](../modules/sssd-attention.md).
+`True` if `triton` is importable, `False` otherwise (degrades gracefully via
+`try/except ImportError`). Every module that imports Triton kernels does so
+through this flag, so the package works without Triton installed — you just
+don't get the fused GPU path.
 
 ## `triton_kernels.py`
 
 | Symbol | Used by | Purpose |
 | :--- | :--- | :--- |
-| `sssd_parallel_scan_gpu_kernel` / `launch_sssd_triton_scan` | [SSSD Attention](../modules/sssd-attention.md) | Parallel spectral scan across the batch/head grid |
-| `cham_holographic_gpu_kernel` / `launch_cham_triton_update` | [CHAM Memory](../modules/cham-memory.md) | Fused holographic write + retract + read per token |
+| `sssd_cayley_scan_kernel` / `launch_sssd_triton_scan` | [SSSD Attention](../modules/sssd-attention.md) | Per-step Cayley-transform unitary state scan across the batch/head grid |
+| `cham_holographic_scan_kernel` / `launch_cham_triton_update` | [CHAM Memory](../modules/cham-memory.md) | Fused holographic write + retract + read per token |
 | `mcmoe_manifold_gpu_kernel` / `launch_mcmoe_triton_projection` | [M-CMoE](../modules/mcmoe.md) | Fused top-K manifold projection per token |
 
 Each `launch_*` function asserts its input tensors are on CUDA

@@ -5,6 +5,7 @@ Implements PyTorch Dataset and DataLoader pipelines for text pre-training with t
 
 import json
 import os
+import warnings
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any, Optional
@@ -18,7 +19,7 @@ class TextDataset(Dataset):
     """
     def __init__(
         self,
-        data_path: str,
+        data_path: Optional[str],
         tokenizer: Optional[VeraceTokenizer] = None,
         context_length: int = 4096,
         stride: Optional[int] = None
@@ -30,15 +31,22 @@ class TextDataset(Dataset):
         self.samples = []
         self._load_and_tokenize(data_path)
 
-    def _load_and_tokenize(self, data_path: str):
+    def _load_and_tokenize(self, data_path: Optional[str]):
         token_stream = []
 
-        if os.path.isfile(data_path):
+        if data_path is not None and os.path.isfile(data_path):
             files = [data_path]
-        elif os.path.isdir(data_path):
+        elif data_path is not None and os.path.isdir(data_path):
             files = [os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith(('.txt', '.jsonl'))]
         else:
-            # Fallback synthetic data if file does not exist
+            # Fallback synthetic data if file does not exist -- loud on purpose: training
+            # on this instead of a real corpus by accident should never pass silently.
+            warnings.warn(
+                f"TextDataset: data_path '{data_path}' does not exist as a file or "
+                f"directory. Falling back to a repeated synthetic sentence -- any "
+                f"training run using this dataset is NOT learning from real data.",
+                stacklevel=2
+            )
             raw_text = "Verace V1 Next Generation Intelligence Architecture with Spectral Attention and Continuous Associative Memory. " * 50
             token_stream.extend(self.tokenizer.encode(raw_text))
             files = []
@@ -66,7 +74,13 @@ class TextDataset(Dataset):
                 self.samples.append({"input_ids": input_ids, "labels": labels})
 
         if len(self.samples) == 0:
-            # Synthetic fallback sample if dataset was too short
+            # Fallback: repeat the (too-short) real token stream to fill one context window.
+            warnings.warn(
+                f"TextDataset: '{data_path}' produced only {num_tokens} tokens, fewer than "
+                f"context_length={self.context_length}. Repeating them to fill one sample -- "
+                f"provide more data for a real training run.",
+                stacklevel=2
+            )
             seq = (token_stream * ((self.context_length + 2) // max(1, len(token_stream)) + 1))[: self.context_length + 1]
             input_ids = torch.tensor(seq[:-1], dtype=torch.long)
             labels = torch.tensor(seq[1:], dtype=torch.long)
@@ -80,7 +94,7 @@ class TextDataset(Dataset):
 
 
 def create_pretrain_dataloader(
-    data_path: str,
+    data_path: Optional[str],
     tokenizer: Optional[VeraceTokenizer] = None,
     batch_size: int = 4,
     context_length: int = 4096,

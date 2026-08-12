@@ -7,7 +7,7 @@ the Unitary Muon optimizer, a pretraining step, and generation.
 import torch
 from verace_v1.config import VeraceV1Config
 from verace_v1.modules.backbone import VeraceV1Model
-from verace_v1.optimizer.unitary_muon import UnitaryMuon
+from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer
 from verace_v1.training.pretrain import train_pretrain_step
 from verace_v1.serving.hyper_generate import VeraceV1Generator
 from verace_v1.eval.benchmark_runner import VeraceV1Evaluator
@@ -28,11 +28,11 @@ def test_end2end_pipeline():
     )
     
     # 1. Model Instantiation
-    model = VeraceV1Model(config)
-    
+    model = VeraceV1Model(config).cuda()
+
     # 2. Input Tokens & Forward Pass
     b, s = 2, 16
-    input_ids = torch.randint(0, config.vocab_size, (b, s))
+    input_ids = torch.randint(0, config.vocab_size, (b, s), device="cuda")
     labels = input_ids.clone()
     
     logits, depth_counts = model(input_ids, use_adaptive_depth=True)
@@ -41,8 +41,8 @@ def test_end2end_pipeline():
     assert not torch.isnan(logits).any()
     print(f"Forward pass successful. Average depth: {depth_counts.float().mean():.2f}")
 
-    # 3. Unitary Muon Optimizer & Training Step
-    optimizer = UnitaryMuon(model.parameters(), lr=0.01)
+    # 3. Hybrid Muon/AdamW Optimizer & Training Step
+    optimizer = build_hybrid_optimizer(model, muon_lr=0.01, adamw_lr=0.001)
     batch = {"input_ids": input_ids, "labels": labels}
     
     ce_loss, mean_depth = train_pretrain_step(model, optimizer, batch)

@@ -8,7 +8,10 @@ first here and found to enter a persistent oscillation (never converging) for ma
 with small singular values, which is the common case for real weight-matrix gradients.
 """
 
+from typing import Dict, List, Optional
+
 import torch
+import torch.nn as nn
 from torch.optim import Optimizer
 
 def stiefel_orthogonalize(G: torch.Tensor, steps: int = 5, tol: float = 1e-2) -> torch.Tensor:
@@ -110,4 +113,90 @@ class UnitaryMuon(Optimizer):
                 p.data.add_(update, alpha=-lr)
 
         return loss
+
+
+class HybridMuonAdamW:
+    """
+    Routes a model's 2D hidden-layer weight matrices through UnitaryMuon and
+    everything else (the tied embedding/lm_head table, and every <2D
+    parameter -- norm gains, biases) through AdamW.
+
+    Orthogonalizing a matrix that acts as a linear map at every forward pass
+    is what Muon-family optimizers are for; forcing an embedding table's rows
+    (which encode per-token semantics and frequency-correlated norms, not a
+    linear transform) onto the Stiefel manifold every step fights what the
+    table needs to represent and is a documented way to stall convergence --
+    published Muon implementations exclude embeddings/heads/scalars for
+    exactly this reason. Exposes the same zero_grad/step/state_dict surface
+    as a single torch.optim.Optimizer so callers don't need to special-case it.
+    """
+    def __init__(self, muon_optimizer: UnitaryMuon, adamw_optimizer: torch.optim.AdamW):
+        self.muon_optimizer = muon_optimizer
+        self.adamw_optimizer = adamw_optimizer
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.muon_optimizer.zero_grad(set_to_none=set_to_none)
+        self.adamw_optimizer.zero_grad(set_to_none=set_to_none)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = self.muon_optimizer.step(closure)
+        self.adamw_optimizer.step()
+        return loss
+
+    def state_dict(self) -> Dict:
+        return {
+            "muon": self.muon_optimizer.state_dict(),
+            "adamw": self.adamw_optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: Dict):
+        self.muon_optimizer.load_state_dict(state["muon"])
+        self.adamw_optimizer.load_state_dict(state["adamw"])
+
+    @property
+    def param_groups(self) -> List[Dict]:
+        return self.muon_optimizer.param_groups + self.adamw_optimizer.param_groups
+
+
+def build_hybrid_optimizer(
+    model: nn.Module,
+    muon_lr: float = 0.03,
+    muon_momentum: float = 0.98,
+    muon_weight_decay: float = 0.05,
+    adamw_lr: float = 3e-4,
+    adamw_weight_decay: float = 0.0,
+    adamw_betas: tuple = (0.9, 0.95),
+) -> HybridMuonAdamW:
+    """
+    Splits model.named_parameters() into the two groups HybridMuonAdamW
+    expects: the tied embed_tokens/lm_head weight and every parameter with
+    ndim < 2 go to AdamW; every other 2D weight matrix goes to UnitaryMuon.
+    """
+    embedding_weight: Optional[torch.Tensor] = None
+    if hasattr(model, "embed_tokens"):
+        embedding_weight = model.embed_tokens.weight
+
+    muon_params: List[torch.nn.Parameter] = []
+    adamw_params: List[torch.nn.Parameter] = []
+    seen_ids = set()
+
+    for p in model.parameters():
+        if not p.requires_grad or id(p) in seen_ids:
+            continue
+        seen_ids.add(id(p))
+
+        is_tied_embedding = embedding_weight is not None and p is embedding_weight
+        if p.ndim == 2 and not is_tied_embedding:
+            muon_params.append(p)
+        else:
+            adamw_params.append(p)
+
+    muon_optimizer = UnitaryMuon(
+        muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay
+    )
+    adamw_optimizer = torch.optim.AdamW(
+        adamw_params, lr=adamw_lr, weight_decay=adamw_weight_decay, betas=adamw_betas
+    )
+    return HybridMuonAdamW(muon_optimizer, adamw_optimizer)
 

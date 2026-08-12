@@ -12,7 +12,7 @@ import torch
 from verace_v1.config import VeraceV1Config
 from verace_v1.modules.backbone import VeraceV1Model
 from verace_v1.training.pretrain import train_pretrain_step
-from verace_v1.optimizer.unitary_muon import UnitaryMuon
+from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer
 
 def _small_config(**overrides):
     config = VeraceV1Config(
@@ -31,11 +31,11 @@ def test_fallback_prepends_instead_of_overwriting_text():
     """No placeholder configured -> visual tokens are prepended, text is untouched."""
     torch.manual_seed(0)
     config = _small_config()
-    model = VeraceV1Model(config)
+    model = VeraceV1Model(config).cuda()
     model.eval()
 
-    input_ids = torch.randint(0, config.vocab_size, (1, 5))
-    images = torch.randn(1, 3, 16, 8)  # -> 4 visual tokens after 2x2 merge
+    input_ids = torch.randint(0, config.vocab_size, (1, 5), device="cuda")
+    images = torch.randn(1, 3, 16, 8, device="cuda")  # -> 4 visual tokens after 2x2 merge
 
     with torch.no_grad():
         text_embeds = model.embed_tokens(input_ids).clone()
@@ -51,15 +51,15 @@ def test_placeholder_routing_preserves_sequence_length_and_other_text():
     """Placeholder configured and present -> only those positions change, seq_len is preserved."""
     torch.manual_seed(0)
     config = _small_config(media_placeholder_token_id=1999)
-    model = VeraceV1Model(config)
+    model = VeraceV1Model(config).cuda()
     model.eval()
 
-    input_ids = torch.randint(0, 1999, (1, 8))
+    input_ids = torch.randint(0, 1999, (1, 8), device="cuda")
     placeholder_positions = [2, 5]
     for pos in placeholder_positions:
         input_ids[0, pos] = 1999
 
-    images = torch.randn(1, 3, 8, 8)  # -> 1 visual token
+    images = torch.randn(1, 3, 8, 8, device="cuda")  # -> 1 visual token
 
     with torch.no_grad():
         text_embeds = model.embed_tokens(input_ids).clone()
@@ -82,11 +82,11 @@ def test_pretrain_step_aligns_logits_when_images_grow_sequence_length():
     """
     torch.manual_seed(0)
     config = _small_config()
-    model = VeraceV1Model(config)
-    optimizer = UnitaryMuon(model.parameters(), lr=0.01)
+    model = VeraceV1Model(config).cuda()
+    optimizer = build_hybrid_optimizer(model, muon_lr=0.01, adamw_lr=0.001)
 
-    input_ids = torch.randint(0, config.vocab_size, (1, 5))
-    images = torch.randn(1, 3, 16, 8)
+    input_ids = torch.randint(0, config.vocab_size, (1, 5), device="cuda")
+    images = torch.randn(1, 3, 16, 8, device="cuda")
     batch = {"input_ids": input_ids, "labels": input_ids.clone(), "image": images}
 
     ce_loss, mean_depth = train_pretrain_step(model, optimizer, batch)

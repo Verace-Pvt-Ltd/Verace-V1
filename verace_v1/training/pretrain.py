@@ -56,16 +56,21 @@ def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
     num_warmup_steps: int,
     num_training_steps: int,
-    min_lr_ratio: float = 0.1
+    min_lr_ratio: float = 0.1,
+    last_epoch: int = -1
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Creates a Cosine Learning Rate Schedule with Linear Warmup."""
+    """
+    Creates a Cosine Learning Rate Schedule with Linear Warmup. Pass
+    last_epoch=resumed_step - 1 when resuming from a checkpoint so the
+    schedule continues from the right point instead of restarting warmup.
+    """
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
 
 def save_checkpoint(
@@ -84,6 +89,22 @@ def save_checkpoint(
     }
     torch.save(state_dict, ckpt_path)
     print(f"[Verace V1 Checkpoint] Saved checkpoint at step {step} to {ckpt_path}")
+
+
+def load_checkpoint(
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    checkpoint_path: str,
+    map_location: str = "cpu"
+) -> int:
+    """Loads a training checkpoint saved by save_checkpoint. Returns the step it was saved at."""
+    state_dict = torch.load(checkpoint_path, map_location=map_location)
+    model.load_state_dict(state_dict["model"])
+    if optimizer is not None:
+        optimizer.load_state_dict(state_dict["optimizer"])
+    step = state_dict.get("step", 0)
+    print(f"[Verace V1 Checkpoint] Loaded checkpoint from {checkpoint_path} at step {step}")
+    return step
 
 
 def train_pretrain_step(

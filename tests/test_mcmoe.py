@@ -9,8 +9,8 @@ def test_mcmoe():
     rank = 16
     num_components = 8
     
-    moe = ManifoldContinuousMoE(hidden_dim=d, rank=rank, num_components=num_components)
-    x = torch.randn(b, s, d)
+    moe = ManifoldContinuousMoE(hidden_dim=d, rank=rank, num_components=num_components).cuda()
+    x = torch.randn(b, s, d, device="cuda")
     
     y = moe(x)
     assert y.shape == (b, s, d)

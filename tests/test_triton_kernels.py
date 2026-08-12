@@ -8,7 +8,7 @@ not require grad). These tests run both paths through the *same* module instance
 weights) on the *same* device and assert the outputs match, which is what actually exercises
 each launch_* Triton kernel against its reference recurrence.
 
-Requires a CUDA device; skipped entirely otherwise.
+Requires a CUDA device.
 """
 
 import pytest
@@ -18,8 +18,6 @@ import torch.nn.functional as F
 from verace_v1.modules.sssd_attention import SSSDAttention
 from verace_v1.modules.cham_memory import ContinuousHolographicMemory
 from verace_v1.modules.mcmoe import ManifoldContinuousMoE
-
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels require CUDA")
 
 TOL = dict(rtol=1e-3, atol=1e-4)
 FP64_TOL = dict(rtol=1e-4, atol=1e-4)
