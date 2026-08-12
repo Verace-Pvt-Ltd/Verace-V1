@@ -39,3 +39,6 @@ logs/
 data/
 *.csv
 *.parquet
+
+# Local scratch state (unrelated to this repo's build)
+memory.db
