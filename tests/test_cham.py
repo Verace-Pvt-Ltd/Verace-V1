@@ -136,7 +136,59 @@ def test_newton_schulz_retraction_matches_correct_complex_multiplication():
     print("newton_schulz_unitary_retraction matches the correct (pre-update-consistent) complex multiplication.")
 
 
+def test_cham_raw_state_stays_unitary_over_a_long_sequence():
+    """
+    Regression test for a real training-divergence root cause: the previous per-token
+    update U_t = I + i*gamma*(k_t v_t^T) was only a first-order approximation to unitary
+    (i*(k v^T) is not even Hermitian in general, so it isn't a valid infinitesimal-unitary
+    generator at all), and the RAW accumulated state (H_real, H_imag) -- the second return
+    value, which is what actually gets carried forward as `new_cham_hologram` and reused as
+    initial_hologram -- was never corrected by the Newton-Schulz retraction (by design,
+    per forward()'s comments: retraction is a nonlinear projection that must not be folded
+    into the recurrence). This meant deviation from unitarity was unbounded and compounded
+    across the sequence: verified in isolation (no training, no GPU) to reach O(1)
+    deviation within a single 256-token sequence with realistic gamma/k/v magnitudes,
+    eventually pushing the raw state's singular values far enough from 1 that the
+    Newton-Schulz retraction used for readout crossed its own documented divergence
+    boundary (see unitary_muon.py's stiefel_orthogonalize) and produced NaN -- reproduced
+    directly in real training runs at chams_holographic_dim >= 48.
+
+    The existing test_cham_unitary_retraction only exercises s=8 (too short to show
+    compounding) and checks the RETRACTED copy, not the raw state actually being carried
+    forward. This test checks the RAW (H_real, H_imag) directly, at context_length=256
+    (this project's real training context length), with no retraction applied.
+    """
+    torch.manual_seed(0)
+    b, s, d = 2, 256, 64
+    holographic_dim = 64  # matches the 8.3M config that diverged in real training
+
+    cham = ContinuousHolographicMemory(hidden_dim=d, holographic_dim=holographic_dim).cuda()
+    # requires_grad=True to force the O(log S) associative-scan Python path (what
+    # training actually uses) rather than the Triton inference fast path, which is a
+    # separate kernel (verace_v1/serving/triton_kernels.py) not touched by this fix.
+    x = torch.randn(b, s, d, device="cuda", requires_grad=True)
+
+    _, (H_real, H_imag) = cham(x)
+    assert not torch.isnan(H_real).any() and not torch.isnan(H_imag).any()
+
+    HH_r = torch.matmul(H_real[0].T, H_real[0]) + torch.matmul(H_imag[0].T, H_imag[0])
+    eye = torch.eye(holographic_dim, device=x.device)
+    diff = torch.norm(HH_r - eye).item()
+
+    # Old (first-order-approximation) formula reached ~2.4 (order-1, not fp32 rounding)
+    # at s=256 in isolation; the exact-Cayley construction stays near machine precision
+    # (~1e-4 in isolation with complex64). 0.05 is a generous margin above that, still
+    # far below the ~1+ deviation that indicates the old, broken behavior.
+    assert diff < 0.05, (
+        f"CHAM's RAW (carried-forward) state deviates from unitarity by {diff:.4f} after "
+        f"a {s}-token sequence -- expected near-machine-precision deviation from an exact "
+        f"per-token unitary construction, not compounding drift."
+    )
+    print(f"CHAM raw state stays unitary over a {s}-token sequence: ||H^H H - I|| = {diff:.6f}")
+
+
 if __name__ == "__main__":
     test_cham_unitary_retraction()
     test_cham_unitary_retraction_holds_under_cuda_bf16_autocast()
     test_newton_schulz_retraction_matches_correct_complex_multiplication()
+    test_cham_raw_state_stays_unitary_over_a_long_sequence()

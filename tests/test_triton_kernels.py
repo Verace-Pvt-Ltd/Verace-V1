@@ -1,12 +1,25 @@
 """
 GPU correctness tests for Verace V1 Triton kernels.
 
-Each module (SSSDAttention, ContinuousHolographicMemory, ManifoldContinuousMoE) exposes two
-computation paths that must agree: the eager PyTorch "exact" path (used whenever the input
-tensor requires grad) and the Triton fast inference path (used on CUDA when the input does
-not require grad). These tests run both paths through the *same* module instance (identical
-weights) on the *same* device and assert the outputs match, which is what actually exercises
-each launch_* Triton kernel against its reference recurrence.
+SSSDAttention and ManifoldContinuousMoE each expose two computation paths that must agree:
+the eager PyTorch "exact" path (used whenever the input tensor requires grad) and the
+Triton fast inference path (used on CUDA when the input does not require grad). Those
+tests run both paths through the *same* module instance (identical weights) on the *same*
+device and assert the outputs match, which is what actually exercises each launch_*
+Triton kernel against its reference recurrence.
+
+ContinuousHolographicMemory (CHAM) is the exception: its Triton fast path
+(launch_cham_triton_update / launch_cham_triton_tiled in
+verace_v1/serving/triton_kernels.py) implements the same first-order-only approximate
+unitary update the eager path used to use, which was found to cause unbounded,
+sequence-length-compounding drift from unitarity -- root cause of NaN training
+divergence at chams_holographic_dim >= 48. The eager path was fixed to an exact
+Cayley-transform construction; the Triton kernel was not (porting the fix requires either
+a batched complex linear solve or a hand-derived Woodbury closed form, not yet
+implemented), so cham_memory.py's forward() no longer calls it at all -- CHAM always
+takes the eager path now, regardless of requires_grad. There is nothing to compare it
+against, so CHAM has no triton-vs-eager tests here; see test_cham_eager_path_matches_fp64_ground_truth_at_long_sequences
+for its correctness coverage instead.
 
 Requires a CUDA device.
 """
@@ -25,22 +38,18 @@ FP64_TOL = dict(rtol=1e-4, atol=1e-4)
 
 def _cham_fp64_reference(model, x, active_mask=None):
     """
-    Independent fp64 sequential reference for CHAM (deliberately not sharing code with
-    either the eager parallel-scan path or the Triton kernel). Implements the *deferred
-    retraction* semantics the eager path (cham_memory.py's parallel_complex_prefix_scan +
-    a single per-position Newton-Schulz retraction of the raw prefix product) actually
-    specifies: the raw prefix product P_t = U_t @ ... @ U_1 is carried forward WITHOUT ever
-    being retracted internally (it is only first-order-unitary per step and is allowed to
-    drift); H_0 @ P_t is retracted fresh, independently, at every readout. This is NOT the
-    same function as retracting every step and feeding the retracted value back in -- that
-    was tried and verified (against this same fp64 reference, and against the live eager
-    module) to diverge increasingly with sequence length; this formulation matches the
-    eager module directly at short/medium sequences. At long sequences (s >~ 50) the eager
-    path's own fp32 O(log S) tree-scan realization of this formula has substantial
-    numerical error relative to this fp64 ground truth (its raw P drifts far from unitary
-    and its particular fp32 accumulation order handles that drift poorly) -- this is a
-    property of the eager implementation, not of this reference or of the Triton kernel,
-    both of which track this fp64 answer to ~1e-6 regardless of sequence length.
+    Independent fp64 sequential reference for CHAM's exact-Cayley unitary update
+    (deliberately not sharing code with the eager parallel-scan path), using native
+    complex128 throughout for precision. Per-token factor U_t = (I - i*G_t/2)^{-1}(I +
+    i*G_t/2) for Hermitian generator G_t = gamma_t*(k_t v_t^T + v_t k_t^T) -- matching
+    cham_memory.py's forward() exactly (see that module for why this construction is
+    EXACTLY unitary, unlike the first-order approximation U_t = I + i*gamma_t*(k_t v_t^T)
+    it replaced, whose deviation from unitarity compounded unboundedly with sequence
+    length and was the root cause of NaN training divergence at chams_holographic_dim
+    >= 48). Implements the *deferred retraction* semantics the eager path actually
+    specifies: the raw prefix product P_t = U_t @ ... @ U_1 is carried forward WITHOUT
+    ever being retracted internally; H_0 @ P_t is retracted fresh, independently, at
+    every readout (see cham_memory.py's forward() docstring/comments).
     """
     with torch.no_grad():
         q = F.normalize(model.w_q(x), p=2, dim=-1).double()
@@ -54,19 +63,24 @@ def _cham_fp64_reference(model, x, active_mask=None):
             gamma = gamma * am.to(gamma.dtype)
 
         b, s, h_dim = q.shape
-        eye = torch.eye(h_dim, dtype=torch.float64, device=x.device)
+        eye_c = torch.eye(h_dim, dtype=torch.complex128, device=x.device)
+        eye_r = torch.eye(h_dim, dtype=torch.float64, device=x.device)
         rec = torch.zeros(b, s, h_dim, dtype=torch.float64, device=x.device)
         for bi in range(b):
-            Pr, Pi = eye.clone(), torch.zeros(h_dim, h_dim, dtype=torch.float64, device=x.device)
+            P = eye_c.clone()
             for t in range(s):
                 kt, vt, qt, gt = k[bi, t], v[bi, t], q[bi, t], gamma[bi, t, 0]
-                KV = torch.outer(kt, vt)
-                Pr, Pi = Pr - gt * (KV @ Pi), Pi + gt * (KV @ Pr)
-                Hr, Hi = Pr.clone(), Pi.clone()  # H_0 = I -> H_0 @ P_t == P_t
+                G = (gt * (torch.outer(kt, vt) + torch.outer(vt, kt))).to(torch.complex128)
+                right = eye_c - 0.5j * G
+                left = eye_c + 0.5j * G
+                U = torch.linalg.solve(right, left)
+                P = U @ P
+                # Fresh independent retraction at readout (H_0 = I -> H_0 @ P_t == P_t)
+                Hr, Hi = P.real.clone(), P.imag.clone()
                 for _ in range(3):
                     HHr = Hr.T @ Hr + Hi.T @ Hi
                     HHi = Hr.T @ Hi - Hi.T @ Hr
-                    dr, di = 3.0 * eye - HHr, -HHi
+                    dr, di = 3.0 * eye_r - HHr, -HHi
                     Hr, Hi = 0.5 * (Hr @ dr - Hi @ di), 0.5 * (Hr @ di + Hi @ dr)
                 rec[bi, t] = Hr @ qt
         return model.norm(model.w_out(rec.to(torch.float32)))
@@ -141,67 +155,53 @@ def test_sssd_triton_initial_state_roundtrip():
 # =====================================================================
 # CHAM (holographic unitary update + Newton-Schulz retraction)
 # =====================================================================
+# No triton-vs-eager comparison tests here: CHAM's Triton path is disabled (see module
+# docstring above) and forward() always takes the eager path now, so there is nothing
+# distinct to compare it against. Correctness coverage instead comes from
+# test_cham_eager_path_matches_fp64_ground_truth_at_long_sequences below, plus
+# tests/test_cham.py's unitarity regression tests.
 @pytest.mark.parametrize("b,s,holographic_dim", [
     (2, 8, 16),
     (1, 1, 16),
     (2, 5, 16),    # non-power-of-2 seq_len
-    (2, 8, 20),    # non-power-of-2 holographic_dim -> boundary masking + tl.dot padding
-    (2, 6, 160),   # > 128 -> exercises the single-CTA-too-large parallel-scan fallback path
+    (2, 8, 20),    # non-power-of-2 holographic_dim
+    (2, 6, 160),   # > 128 holographic_dim
 ])
-def test_cham_triton_matches_reference(b, s, holographic_dim):
+def test_cham_eager_matches_fp64_reference(b, s, holographic_dim):
     torch.manual_seed(3)
     hidden_dim = 32
     model = ContinuousHolographicMemory(hidden_dim=hidden_dim, holographic_dim=holographic_dim).cuda()
     x = torch.randn(b, s, hidden_dim, device="cuda")
 
-    with torch.no_grad():
-        out_tri, _ = model(x.clone())
+    out_eager, _ = model(x.clone().requires_grad_(True))
     out_gold = _cham_fp64_reference(model, x)
 
-    assert out_tri.shape == out_gold.shape
-    assert not torch.isnan(out_tri).any()
-    torch.testing.assert_close(out_tri, out_gold, **FP64_TOL)
+    assert out_eager.shape == out_gold.shape
+    assert not torch.isnan(out_eager).any()
+    torch.testing.assert_close(out_eager.detach(), out_gold, **FP64_TOL)
 
 
-def test_cham_triton_preserves_unitarity_with_halted_tokens():
+def test_cham_eager_preserves_unitarity_with_halted_tokens():
     torch.manual_seed(4)
     b, s, holographic_dim = 2, 10, 16
     hidden_dim = 32
     model = ContinuousHolographicMemory(hidden_dim=hidden_dim, holographic_dim=holographic_dim).cuda()
-    x = torch.randn(b, s, hidden_dim, device="cuda")
+    x = torch.randn(b, s, hidden_dim, device="cuda", requires_grad=True)
     active_mask = torch.ones(b, s, dtype=torch.bool, device="cuda")
     active_mask[:, s // 2:] = False
 
-    with torch.no_grad():
-        out_tri, (Hr_tri, Hi_tri) = model(x.clone(), active_mask=active_mask)
+    out_eager, (Hr, Hi) = model(x.clone(), active_mask=active_mask)
     out_gold = _cham_fp64_reference(model, x, active_mask=active_mask)
 
-    torch.testing.assert_close(out_tri, out_gold, **FP64_TOL)
+    torch.testing.assert_close(out_eager.detach(), out_gold, **FP64_TOL)
 
     # model()'s second return value is the RAW (never-retracted) state, by design --
     # see cham_memory.py's forward() docstring. Newton-Schulz retraction's exactness
     # guarantee (H^H H = I) applies on read, so retract before checking it.
-    Hr_ro, Hi_ro = newton_schulz_unitary_retraction(Hr_tri, Hi_tri)
+    Hr_ro, Hi_ro = newton_schulz_unitary_retraction(Hr, Hi)
     HH_r = Hr_ro.transpose(-1, -2) @ Hr_ro + Hi_ro.transpose(-1, -2) @ Hi_ro
     eye = torch.eye(holographic_dim, device="cuda").unsqueeze(0).expand(b, -1, -1)
     torch.testing.assert_close(HH_r, eye, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize("s", [8, 16, 32])
-def test_cham_triton_matches_live_eager_at_practical_lengths(s):
-    """Direct trained-vs-served check (no fp64 helper involved): at the sequence lengths
-    this is actually likely to run at, Triton and the live eager forward() must agree
-    tightly, since eager is what the model is trained against."""
-    torch.manual_seed(6)
-    b, holographic_dim, hidden_dim = 2, 16, 32
-    model = ContinuousHolographicMemory(hidden_dim=hidden_dim, holographic_dim=holographic_dim).cuda()
-    x = torch.randn(b, s, hidden_dim, device="cuda")
-
-    out_eager, _ = model(x.clone().requires_grad_(True))
-    with torch.no_grad():
-        out_tri, _ = model(x.clone())
-
-    torch.testing.assert_close(out_tri, out_eager.detach(), rtol=5e-2, atol=2e-2)
 
 
 def test_cham_eager_path_matches_fp64_ground_truth_at_long_sequences():
@@ -209,28 +209,23 @@ def test_cham_eager_path_matches_fp64_ground_truth_at_long_sequences():
     cham_memory.py's parallel_newton_schulz_retraction had a real bug (not a numerical
     precision limitation): it computed H_real's updated value, then reused that
     already-updated H_real (instead of the pre-update value) to compute H_imag,
-    corrupting the complex multiplication on every iteration past the first. This
-    compounded over long sequences, previously producing >5e-3 error against a fp64
-    ground truth at s=100 here (formerly documented as "known eager-path fragility" --
-    it wasn't fragility, it was a wrong formula). Fixed by computing both outputs from
-    the same pre-update (H_real, H_imag) pair; the eager path now tracks fp64 ground
-    truth as tightly as the Triton kernel (which never had this bug) at long sequences.
+    corrupting the complex multiplication on every iteration past the first. Separately,
+    the per-token update itself was only a first-order approximation to unitary, whose
+    deviation compounded unboundedly with sequence length (root cause of NaN training
+    divergence at chams_holographic_dim >= 48) -- fixed via an exact Cayley-transform
+    construction. This checks the eager path tracks the (now-matching) fp64 ground truth
+    tightly even at long sequences, where both of the above would have shown up.
     """
     torch.manual_seed(7)
     b, s, holographic_dim, hidden_dim = 2, 100, 16, 32
     model = ContinuousHolographicMemory(hidden_dim=hidden_dim, holographic_dim=holographic_dim).cuda()
-    x = torch.randn(b, s, hidden_dim, device="cuda")
+    x = torch.randn(b, s, hidden_dim, device="cuda", requires_grad=True)
 
-    out_eager, _ = model(x.clone().requires_grad_(True))
-    with torch.no_grad():
-        out_tri, _ = model(x.clone())
+    out_eager, _ = model(x.clone())
     out_gold = _cham_fp64_reference(model, x)
 
-    tri_err = (out_tri.double() - out_gold.double()).abs().max().item()
     eager_err = (out_eager.detach().double() - out_gold.double()).abs().max().item()
-
-    assert tri_err < 1e-4, f"Triton should stay near fp64 ground truth at s={s}, got {tri_err:.2e}"
-    assert eager_err < 1e-4, f"Eager should now stay near fp64 ground truth at s={s} too, got {eager_err:.2e}"
+    assert eager_err < 1e-4, f"Eager should stay near fp64 ground truth at s={s}, got {eager_err:.2e}"
 
 
 # =====================================================================
