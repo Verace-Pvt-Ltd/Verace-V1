@@ -10,6 +10,7 @@ from verace_v1.config import VeraceV1Config
 from verace_v1.modules.backbone import VeraceV1Model
 from verace_v1.optimizer.unitary_muon import build_hybrid_optimizer
 from verace_v1.training.pretrain import (
+    evaluate_loss,
     get_cosine_schedule_with_warmup,
     load_checkpoint,
     save_checkpoint,
@@ -134,7 +135,61 @@ def test_train_pretrain_step_clips_gradients_and_reports_grad_norm():
     print(f"Reported grad_norm={diagnostics['grad_norm']:.4f} (pre-clip), actual post-clip norm={total_norm_after_clip:.6f}.")
 
 
+def test_evaluate_loss_is_deterministic_no_grad_and_restores_train_mode():
+    """
+    evaluate_loss must: (1) not require/populate gradients, (2) return the same value
+    across repeated calls on the same fixed batches (no dropout-like randomness leaking
+    through, unlike train_pretrain_step's stochastic ACD halting -- this model has none
+    of that at eval since use_adaptive_depth's ponder logic is itself deterministic given
+    fixed weights), and (3) leave the model in .train() mode afterward so the caller's
+    training loop can resume immediately without an explicit model.train() call.
+    """
+    config = VeraceV1Config(
+        vocab_size=200, hidden_dim=32, num_layers=2, num_heads=2, head_dim=16,
+        spectral_dim=8, chams_holographic_dim=8, mcmoe_rank=4, mcmoe_num_components=4,
+        max_cognitive_depth=2, min_cognitive_depth=1
+    )
+    model = VeraceV1Model(config).cuda()
+    model.train()
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 8), device="cuda")
+    batch = {"input_ids": input_ids, "labels": input_ids.clone()}
+    dataloader = [batch, batch]  # any iterable of batches works -- evaluate_loss doesn't need a real DataLoader
+
+    loss_a = evaluate_loss(model, dataloader, device="cuda")
+    assert model.training, "evaluate_loss must restore model.train() before returning"
+
+    loss_b = evaluate_loss(model, dataloader, device="cuda")
+    assert abs(loss_a - loss_b) < 1e-6, "evaluate_loss should be deterministic on fixed weights/batches"
+
+    for p in model.parameters():
+        assert p.grad is None, "evaluate_loss must not populate gradients"
+
+    print(f"evaluate_loss deterministic: {loss_a:.6f} == {loss_b:.6f}, no grads populated, train mode restored.")
+
+
+def test_evaluate_loss_respects_max_batches():
+    """max_batches=1 should only average over the first batch, not iterate the whole dataloader."""
+    config = VeraceV1Config(
+        vocab_size=200, hidden_dim=32, num_layers=2, num_heads=2, head_dim=16,
+        spectral_dim=8, chams_holographic_dim=8, mcmoe_rank=4, mcmoe_num_components=4,
+        max_cognitive_depth=2, min_cognitive_depth=1
+    )
+    model = VeraceV1Model(config).cuda()
+
+    batch_a = {"input_ids": torch.randint(0, config.vocab_size, (2, 8), device="cuda")}
+    batch_a["labels"] = batch_a["input_ids"].clone()
+    batch_b = {"input_ids": torch.randint(0, config.vocab_size, (2, 8), device="cuda")}
+    batch_b["labels"] = batch_b["input_ids"].clone()
+
+    loss_first_only = evaluate_loss(model, [batch_a, batch_b], device="cuda", max_batches=1)
+    loss_first_direct = evaluate_loss(model, [batch_a], device="cuda")
+    assert abs(loss_first_only - loss_first_direct) < 1e-6, "max_batches=1 should match evaluating batch_a alone"
+
+
 if __name__ == "__main__":
     test_resumed_scheduler_matches_continuous_training_not_a_warmup_restart()
     test_save_and_load_checkpoint_roundtrip_preserves_model_and_optimizer_state()
+    test_evaluate_loss_is_deterministic_no_grad_and_restores_train_mode()
+    test_evaluate_loss_respects_max_batches()
     test_train_pretrain_step_clips_gradients_and_reports_grad_norm()

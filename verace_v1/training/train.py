@@ -34,6 +34,7 @@ from verace_v1.tokenizer import VeraceTokenizer
 from verace_v1.tokenizer.gpt_neo_top10k import build_gpt_neo_top10k_tokenizer, VOCAB_SIZE as GPT_NEO_TOP10K_VOCAB_SIZE
 from verace_v1.training.diagnostics import CHAMInvariantProbe
 from verace_v1.training.pretrain import (
+    evaluate_loss,
     get_cosine_schedule_with_warmup,
     load_checkpoint,
     save_checkpoint,
@@ -66,6 +67,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_tokens", type=int, default=None,
                     help="Cap on tokens read from --data_path (stops reading/tokenizing "
                          "once reached). Omit to use the whole corpus.")
+    p.add_argument("--val_data_path", type=str, default=None,
+                    help="Path to a held-out .txt/.jsonl file or directory, disjoint from "
+                         "--data_path. If given, periodically logs a no-grad held-out "
+                         "'eval_loss' (see --eval_every) -- the number comparable to the "
+                         "TinyStories paper's published eval_loss figures. Omitted: no "
+                         "eval_loss is logged (train_log.jsonl only has train-batch loss).")
+    p.add_argument("--eval_every", type=int, default=200,
+                    help="Compute --val_data_path eval_loss every N steps (ignored if "
+                         "--val_data_path isn't given).")
+    p.add_argument("--eval_batches", type=int, default=50,
+                    help="Number of validation batches averaged per eval_loss computation.")
     p.add_argument("--tokenizer", type=str, default="moonshot", choices=["moonshot", "gpt_neo_top10k"],
                     help="'moonshot' (default): Verace's own vendored Kimi K3 tokenizer. "
                          "'gpt_neo_top10k': GPT-Neo's BPE tokenizer restricted to its 10,000 "
@@ -187,6 +199,17 @@ def main():
         max_tokens=args.max_tokens,
     )
 
+    val_dataloader = None
+    if args.val_data_path:
+        val_dataloader = create_pretrain_dataloader(
+            data_path=args.val_data_path,
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            context_length=args.context_length,
+            num_workers=args.num_workers,
+            shuffle=False,
+        )
+
     model = VeraceV1Model(config).to(args.device)
     n_params, est_mem_gb = estimate_param_and_optimizer_memory_gb(model)
     print(f"[Verace V1 Pretrain] Model: {n_params / 1e6:.2f}M params on {args.device}. "
@@ -254,6 +277,12 @@ def main():
             adamw_scheduler.step()
             recent_step_times.append(time.time() - t0)
 
+            eval_loss = None
+            if val_dataloader is not None and (step % args.eval_every == 0 or step == args.steps - 1):
+                eval_loss = evaluate_loss(model, val_dataloader, args.device, max_batches=args.eval_batches)
+                print(f"[step {step}/{args.steps}] eval_loss={eval_loss:.4f} (held-out, "
+                      f"{args.eval_batches} batches from {args.val_data_path})")
+
             if step % args.log_every == 0 or step == args.steps - 1:
                 window = recent_step_times[-args.log_every:]
                 avg_ms = (sum(window) / len(window)) * 1000
@@ -270,7 +299,7 @@ def main():
                       f"muon_lr={muon_lr:.2e} adamw_lr={adamw_lr:.2e} {avg_ms:.0f}ms/step")
 
                 log_record = {
-                    "step": step, "loss": ce_loss, "cham_deviation": cham_deviation,
+                    "step": step, "loss": ce_loss, "eval_loss": eval_loss, "cham_deviation": cham_deviation,
                     "muon_lr": muon_lr, "adamw_lr": adamw_lr, "ms_per_step": avg_ms,
                     **diagnostics,
                 }

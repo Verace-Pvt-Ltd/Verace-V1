@@ -187,3 +187,50 @@ def train_pretrain_step(
 
     return ce_loss.item(), torch.mean(depth_counts.float()).item()
 
+
+@torch.no_grad()
+def evaluate_loss(
+    model: VeraceV1Model,
+    dataloader,
+    device: str,
+    max_batches: Optional[int] = None,
+) -> float:
+    """
+    Mean held-out next-token cross-entropy loss (nats), matching train_pretrain_step's
+    logits/labels shift-and-align exactly but without the depth/energy penalty terms
+    (training-time regularizers, not part of a reported "eval loss") and without
+    gradients. This is the number to compare against the TinyStories paper's
+    (arXiv:2305.07759) published per-model eval_loss figures -- those are themselves
+    plain held-out cross-entropy on a disjoint validation split.
+
+    Iterates the whole dataloader once, or stops after max_batches batches if given
+    (a full pass over a large validation file on every eval can dominate wall-clock
+    time otherwise). Restores model.train() before returning so callers can resume
+    training immediately.
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    for i, batch in enumerate(dataloader):
+        if max_batches is not None and i >= max_batches:
+            break
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+
+        logits, _ = model(input_ids, use_adaptive_depth=True)
+        if logits.shape[1] != labels.shape[1]:
+            logits = logits[:, -labels.shape[1]:, :]
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        total_loss += loss.item()
+        n_batches += 1
+
+    model.train()
+    return total_loss / max(n_batches, 1)
+
