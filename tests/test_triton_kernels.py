@@ -45,7 +45,7 @@ def _cham_fp64_reference(model, x, active_mask=None):
     with torch.no_grad():
         q = F.normalize(model.w_q(x), p=2, dim=-1).double()
         k = F.normalize(model.w_k(x), p=2, dim=-1).double()
-        v = F.silu(model.w_v(x)).double()
+        v = F.normalize(F.silu(model.w_v(x)), p=2, dim=-1).double()
         gamma = (0.1 * torch.sigmoid(model.w_gamma(x))).double()
         if active_mask is not None:
             am = active_mask

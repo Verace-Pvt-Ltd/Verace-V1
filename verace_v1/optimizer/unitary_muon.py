@@ -1,11 +1,27 @@
 """
 Unitary Muon Optimizer Module
-Implements exact Stiefel-manifold orthogonal updates for every 2D parameter (square,
-tall, or wide) via SVD-based polar decomposition: G = U diag(S) V^T, Q = U V^T.
-This guarantees Q^T Q = I (or Q Q^T = I) to floating-point precision regardless of G's
-singular value spectrum -- unlike iterative Newton-Schulz methods, which were tried
-first here and found to enter a persistent oscillation (never converging) for matrices
-with small singular values, which is the common case for real weight-matrix gradients.
+Implements Stiefel-manifold orthogonal updates for every 2D parameter (square, tall, or
+wide). The primary path is Keller Jordan's quintic Newton-Schulz iteration
+(https://kellerjordan.github.io/posts/muon/) -- fast and GPU-friendly, but only bounded
+when scaled correctly: divide by the Frobenius norm alone (never rescale further), so
+every singular value provably lands in [0, 1] before iterating. The scalar recursion
+sigma -> sigma*(3.4445 - 4.7750*sigma^2 + 2.0315*sigma^4) has an unstable fixed point at
+sigma ~= 1.2637 (verified numerically: g'(1.2637) ~= 6.5, |g'|>1) that acts as a hard
+divergence boundary -- singular values below it stay bounded under repeated iteration,
+values above it diverge to Inf/NaN within 2-3 steps. An earlier version of this module
+additionally rescaled by sqrt(min_dim) on top of the Frobenius-norm division, which
+breaks the [0, 1] guarantee: for a skewed/low-rank spectrum (the typical case for real
+transformer weight gradients), it can push the dominant singular value above 1.2637 --
+verified directly to cause exactly this Inf/NaN blowup. That was a real, fixable scaling
+bug in this codebase, not a fundamental property of Newton-Schulz iteration, and has been
+fixed (X_scaled = X / norm, matching Keller Jordan's original). Note that staying below
+the divergence boundary does not by itself guarantee convergence to machine-precision
+orthogonality within `steps` iterations (`steps=5` here is just this function's default
+parameter value, not a fixed budget -- raise it if a particular spectrum needs more): for
+spread-out spectra, deviation can plateau well above `tol` regardless of how many more
+steps are run (a bounded, non-divergent fixed point/cycle other than the identity, not
+solved by iterating longer), which is exactly what the SVD fallback below exists to
+handle.
 """
 
 import warnings
@@ -27,12 +43,24 @@ def stiefel_orthogonalize(G: torch.Tensor, steps: int = 5, tol: float = 1e-2) ->
 
     m, n = G.shape
     X = G.float()
-    min_dim = min(m, n)
 
     norm = torch.norm(X)
     if norm > 1e-7:
-        # Scale matrix so Frobenius norm matches expected orthogonal norm sqrt(min_dim)
-        X_scaled = (X / norm) * (min_dim ** 0.5)
+        # Scale by the Frobenius norm ALONE (matching Keller Jordan's original Muon
+        # NewtonSchulz5: `X /= X.norm()`, https://kellerjordan.github.io/posts/muon/).
+        # This is not cosmetic: since ||X||_F^2 = sum(sigma_i^2), dividing by ||X||_F
+        # guarantees every individual singular value of X_scaled lands in [0, 1] --
+        # which is the range these coefficients are proven to converge on. An earlier
+        # version of this function additionally multiplied by sqrt(min_dim) (to target
+        # ||X_scaled||_F = sqrt(min_dim) instead), which breaks that guarantee: for a
+        # skewed/low-rank spectrum (the typical case for real transformer weight
+        # gradients per Keller Jordan's own writeup), it can push the dominant singular
+        # value above 1 -- verified directly to cause the quintic map to blow up to
+        # Inf/NaN within 2-3 iterations for exactly this kind of matrix, whereas the
+        # correct (norm-only) scaling on the same matrix converges cleanly. The SVD
+        # fallback below remains for genuine cusolver GPU convergence failures, not as
+        # a substitute for correct scaling.
+        X_scaled = X / norm
 
         # Quintic Newton-Schulz polynomial coefficients
         a, b, c = 3.4445, -4.7750, 2.0315
@@ -90,20 +118,44 @@ def stiefel_orthogonalize(G: torch.Tensor, steps: int = 5, tol: float = 1e-2) ->
             return X_scaled.to(G.dtype)
 
 
+def stiefel_orthogonalize_per_head(G: torch.Tensor, num_heads: int, steps: int = 5, tol: float = 1e-2) -> torch.Tensor:
+    """
+    Per-Head Muon (Kimi K3 Technical Report, arXiv:2607.24653, Sec. 2.5): for attention
+    Q/K/V projection matrices, orthogonalize each head's [head_dim, in_dim] block
+    separately instead of the full [num_heads*head_dim, in_dim] matrix as one block.
+    Rationale (quoting the paper): "full-matrix orthogonalization treats all heads as a
+    single coupled block, so heads with larger gradient or momentum scales dominate the
+    shared update direction, while smaller-scale heads receive insufficiently normalized
+    updates; per-head orthogonalization equalizes the update scale across heads."
+    G: [num_heads*head_dim, in_dim] (a Linear layer's weight for a Q/K/V-style
+    projection, PyTorch's [out_features, in_features] convention).
+    """
+    if G.ndim != 2 or G.shape[0] % num_heads != 0:
+        return stiefel_orthogonalize(G, steps=steps, tol=tol)
+
+    head_dim = G.shape[0] // num_heads
+    heads = G.view(num_heads, head_dim, G.shape[1])
+    out_heads = torch.stack([stiefel_orthogonalize(heads[h], steps=steps, tol=tol) for h in range(num_heads)], dim=0)
+    return out_heads.view_as(G)
+
+
 class UnitaryMuon(Optimizer):
     """
     Unitary Muon Optimizer.
     Applies exact Stiefel-manifold orthogonalization to every 2D parameter's momentum update.
     Uses fast GPU Newton-Schulz polynomial iterations with automatic SVD fallback.
+    Supports Per-Head Muon (see stiefel_orthogonalize_per_head) via a per-param-group
+    `num_heads` setting (default 1 = ordinary full-matrix orthogonalization).
     """
     def __init__(
         self,
         params,
         lr: float = 0.03,
         momentum: float = 0.98,
-        weight_decay: float = 0.05
+        weight_decay: float = 0.05,
+        num_heads: int = 1
     ):
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, num_heads=num_heads)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -152,7 +204,35 @@ class UnitaryMuon(Optimizer):
                 buf.mul_(momentum).add_(grad)
 
                 if p.ndim == 2:
-                    update = stiefel_orthogonalize(buf)
+                    num_heads = group.get("num_heads", 1)
+                    if num_heads > 1 and p.shape[0] % num_heads == 0:
+                        # Per-Head Muon (Kimi K3, arXiv:2607.24653, Sec. 2.5): orthogonalize
+                        # each head's block separately rather than the full stacked matrix
+                        # as one block, so heads with larger gradient/momentum scales don't
+                        # dominate the shared update direction at the expense of smaller-
+                        # scale heads. See stiefel_orthogonalize_per_head's docstring.
+                        update = stiefel_orthogonalize_per_head(buf, num_heads)
+                        per_head_dim = p.shape[0] // num_heads
+                        max_dim = max(per_head_dim, p.shape[1])
+                    else:
+                        update = stiefel_orthogonalize(buf)
+                        max_dim = max(p.shape[0], p.shape[1])
+                    # Match update RMS across parameter shapes (Moonshot AI, "Muon is
+                    # Scalable for LLM Training", arXiv:2502.16982, Eq. 4 / Lemma 1):
+                    # a semi-orthogonal M x N matrix has RMS = sqrt(1/max(M,N)), which is
+                    # shape-dependent and uncalibrated to anything -- without correction,
+                    # a single shared `lr` gives wildly different effective update
+                    # magnitudes across e.g. a (256,256) and a (1,256) parameter, which
+                    # is not a tuning assumption a single lr can satisfy simultaneously.
+                    # Multiplying by 0.2*sqrt(max(M,N)) cancels the shape dependence
+                    # exactly, giving every 2D parameter the same ~0.2 update RMS
+                    # (matching AdamW's typical 0.2-0.4 update RMS), so lr and
+                    # weight_decay can be shared meaningfully across Muon and AdamW
+                    # parameter groups. Equivalent (up to a global constant) to Keller
+                    # Jordan's own reference implementation's sqrt(max(1, A/B)) scaling.
+                    # When per-head, M/N here are the PER-HEAD block's dims (the shape
+                    # that was actually orthogonalized), not the full stacked matrix's.
+                    update = update * (0.2 * (max_dim ** 0.5))
                 else:
                     update = buf
 
@@ -221,10 +301,28 @@ def build_hybrid_optimizer(
     Splits model.named_parameters() into the two groups HybridMuonAdamW
     expects: the tied embed_tokens/lm_head weight and every parameter with
     ndim < 2 go to AdamW; every other 2D weight matrix goes to UnitaryMuon.
+    SSSDAttention's w_q/w_k/w_v projections (each [num_heads*head_dim, in_dim])
+    get their own Muon param group with num_heads set, so they're orthogonalized
+    per-head (Kimi K3, arXiv:2607.24653, Sec. 2.5) instead of as one full block --
+    see stiefel_orthogonalize_per_head's docstring for why that matters.
     """
     embedding_weight: Optional[torch.Tensor] = None
     if hasattr(model, "embed_tokens"):
         embedding_weight = model.embed_tokens.weight
+
+    # Collect SSSDAttention's Q/K/V projection weights by identity, grouped by
+    # num_heads (uniform across layers in practice, but grouped defensively in
+    # case a future model mixes head counts across layers).
+    per_head_group_ids: Dict[int, List[torch.nn.Parameter]] = {}
+    per_head_param_ids = set()
+    for module in model.modules():
+        if type(module).__name__ == "SSSDAttention":
+            num_heads = getattr(module, "num_heads", 1)
+            for proj_name in ("w_q", "w_k", "w_v"):
+                proj = getattr(module, proj_name, None)
+                if proj is not None and hasattr(proj, "weight"):
+                    per_head_group_ids.setdefault(num_heads, []).append(proj.weight)
+                    per_head_param_ids.add(id(proj.weight))
 
     muon_params: List[torch.nn.Parameter] = []
     adamw_params: List[torch.nn.Parameter] = []
@@ -236,13 +334,19 @@ def build_hybrid_optimizer(
         seen_ids.add(id(p))
 
         is_tied_embedding = embedding_weight is not None and p is embedding_weight
+        if id(p) in per_head_param_ids:
+            continue  # already routed via per_head_group_ids
         if p.ndim == 2 and not is_tied_embedding:
             muon_params.append(p)
         else:
             adamw_params.append(p)
 
+    muon_param_groups: List[Dict] = [{"params": muon_params}]
+    for num_heads, params in per_head_group_ids.items():
+        muon_param_groups.append({"params": params, "num_heads": num_heads})
+
     muon_optimizer = UnitaryMuon(
-        muon_params, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay
+        muon_param_groups, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay
     )
     adamw_optimizer = torch.optim.AdamW(
         adamw_params, lr=adamw_lr, weight_decay=adamw_weight_decay, betas=adamw_betas

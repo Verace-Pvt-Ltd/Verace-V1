@@ -66,9 +66,24 @@ class ManifoldContinuousMoE(nn.Module):
         base_out = self.base_w_down(self.base_situ_glu(x_flat))
 
         # 2. Sparse Top-K Component Routing
+        # Noisy Top-K Gating (Shazeer et al., "Outrageously Large Neural Networks: The
+        # Sparsely-Gated Mixture-of-Experts Layer", arXiv:1701.06538, Eq. 2-5):
+        # G(x) = Softmax(KeepTopK(H(x), k)) -- the top-k MASK is applied to the raw
+        # logits BEFORE softmax (non-selected entries set to -inf), so the softmax
+        # normalizes only over the surviving k entries and their weights always sum to
+        # exactly 1 (a proper convex combination of the selected components). A prior
+        # version of this code applied softmax over all num_components first and only
+        # then took the top-k of the already-normalized weights -- those weights are a
+        # subset of a distribution that summed to 1 over ALL components, so they summed
+        # to less than 1 (verified: ~0.54 for a near-uniform router, the common case at
+        # initialization), systematically under-scaling manifold_adapt by ~2x whenever
+        # the router isn't yet confident.
         k_val = min(self.top_k_components, self.num_components)
         router_logits = self.router(x_flat) # [b*s, num_components]
-        topk_weights, topk_indices = torch.topk(torch.softmax(router_logits, dim=-1), k=k_val, dim=-1)
+        topk_logits, topk_indices = torch.topk(router_logits, k=k_val, dim=-1)
+        masked_logits = torch.full_like(router_logits, float("-inf"))
+        masked_logits.scatter_(-1, topk_indices, topk_logits)
+        topk_weights = torch.gather(torch.softmax(masked_logits, dim=-1), -1, topk_indices)
 
         sigma_all = torch.sigmoid(self.hyper_sigma(x_flat)).view(b * s, self.num_components, self.rank)
 

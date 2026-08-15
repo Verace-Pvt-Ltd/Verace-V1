@@ -81,7 +81,22 @@ class ContinuousHolographicMemory(nn.Module):
 
         q = F.normalize(self.w_q(x), p=2, dim=-1)
         k = F.normalize(self.w_k(x), p=2, dim=-1)
-        v = F.silu(self.w_v(x))
+        # v must be magnitude-bounded, not just direction-bounded like k/q: U_t = I +
+        # i*gamma*(k v^T) is only a first-order ("infinitesimal") approximation to a
+        # unitary matrix, accurate when gamma*||k||*||v|| is small. Unlike SSSD's
+        # analogous construction (verace_v1/modules/sssd_attention.py), which L2-
+        # normalizes BOTH of its outer-product vectors, v here was previously left as
+        # unbounded F.silu(...) output with nothing to stop it from growing during
+        # training. Verified in practice: v's max magnitude grew monotonically and
+        # unboundedly (~2 -> ~17 over 50 steps) as w_v's weights adapted, pushing
+        # gamma*||v|| an order of magnitude past the infinitesimal-approximation regime
+        # and causing the holographic state to go non-finite -- confirmed as the
+        # earliest point of corruption in the whole model via forward-pass tracing
+        # (CHAM's post-retraction output was already non-finite while every other
+        # module's inputs were still clean). L2-normalizing v, like k, keeps
+        # gamma*||k||*||v|| providably bounded by gamma's own ceiling (0.1) regardless
+        # of how the model's weights evolve.
+        v = F.normalize(F.silu(self.w_v(x)), p=2, dim=-1)
         gamma = 0.1 * torch.sigmoid(self.w_gamma(x))
 
         # Zero-Gamma Identity Recurrence for Halted Tokens: gamma = 0 when active_mask is False

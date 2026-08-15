@@ -192,7 +192,11 @@ class VeraceV1Model(nn.Module):
             for layer in self.layers:
                 h_curr, _, _, _ = layer(h_curr)
             final_h = h_curr
-            depth_counts = torch.full((b, s), len(self.layers), device=input_ids.device, dtype=torch.int32)
+            # Float, matching the ACDE path's dtype (which now holds the differentiable
+            # ponder cost rho_t = N(t) + R(t), not a bare int count -- see acd_engine.py).
+            # No halting mechanism runs here, so this is just the constant full-depth
+            # count with no R(t) term, kept type-consistent for downstream consumers.
+            depth_counts = torch.full((b, s), float(len(self.layers)), device=input_ids.device, dtype=token_embeds.dtype)
 
         norm_final_h = self.final_norm(final_h)
         logits = self.lm_head(norm_final_h)

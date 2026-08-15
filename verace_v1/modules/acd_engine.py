@@ -64,7 +64,19 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
         h_curr = h_in.clone()
         final_h = torch.zeros_like(h_in)
         accumulated_prob = torch.zeros(b, s, device=device, dtype=h_in.dtype)
-        depth_counts = torch.zeros(b, s, device=device, dtype=torch.int32)
+        # depth_counts holds the ACT ponder cost rho_t = N(t) + R(t) (Graves 2016,
+        # "Adaptive Computation Time for Recurrent Neural Networks", Eq. 10-14), not a
+        # bare layer count. N(t) (accumulated below via boolean-mask addition) is
+        # already non-differentiable by construction, matching the paper's prescribed
+        # approximation of treating N(t) as constant -- but R(t) (added at the halting
+        # step, see below) is a genuinely differentiable function of the halting
+        # probabilities, which is what gives the depth penalty any gradient at all
+        # w.r.t. w_halting (Eq. 14: dP/dh_t^n = -1 for n<N(t), 0 otherwise -- exactly
+        # what falls out of R(t) = 1 - sum_{n=1}^{N(t)-1} h_t^n). A prior version of
+        # this tensor was plain int32, which has no grad_fn at all: the depth penalty
+        # in train_pretrain_step was contributing to the loss *value* but exactly zero
+        # gradient to the halting unit, silently defeating the entire mechanism.
+        depth_counts = torch.zeros(b, s, device=device, dtype=h_in.dtype)
         active_mask = torch.ones(b, s, device=device, dtype=torch.bool)
 
         num_layers = min(len(layers), max_depth)
@@ -131,16 +143,25 @@ class AdaptiveCognitiveDepthEngine(nn.Module):
             # Gated halting accumulation: accumulate contribution only for active tokens
             update_mask = (active_mask | newly_halted)
             final_h = final_h + (weight_layer * update_mask.to(h_in.dtype)).unsqueeze(-1) * h_next
-            depth_counts = depth_counts + active_mask.to(torch.int32)
+            # N(t) term: +1 per layer a token was active for (non-differentiable, matches
+            # the paper's approximation of N(t) as constant).
+            depth_counts = depth_counts + active_mask.to(h_in.dtype)
+            # R(t) term, added exactly once at the halting step: this is what actually
+            # carries gradient back to w_halting (see comment at depth_counts' init).
+            depth_counts = depth_counts + remainder_weight * newly_halted.to(h_in.dtype)
 
             # Update global state buffers
             accumulated_prob = new_accum
             active_mask = still_active
             h_curr = h_next
 
-        # Any remaining active tokens take full final representation
+        # Any remaining active tokens take full final representation (N(t) = max_depth,
+        # R(t) = whatever probability mass is still unaccounted for -- same rho_t = N(t)
+        # + R(t) formula as the halting branch above, just for the max_depth cutoff case
+        # instead of a genuine halt).
         if active_mask.any():
             remainder_weight = (1.0 - accumulated_prob).clamp(min=0.0)
             final_h = final_h + (remainder_weight * active_mask.to(h_in.dtype)).unsqueeze(-1) * h_curr
+            depth_counts = depth_counts + remainder_weight * active_mask.to(h_in.dtype)
 
         return final_h, depth_counts, layer_states_out

@@ -55,5 +55,48 @@ def test_acd_batch_independence_and_flop_shrinkage():
 
     print(f"Per-example gathering verified. Mean cognitive depth: {depths.float().mean():.2f}")
 
+def test_acd_depth_penalty_has_gradient_to_halting_unit():
+    """
+    Regression test for a real bug: depth_counts was previously an int32 tensor built
+    from boolean-mask addition, which has no grad_fn at all -- the depth/ponder penalty
+    (depth_penalty_weight * mean(depth_counts) in train_pretrain_step) contributed to
+    the loss *value* but exactly zero gradient to ACDE's halting unit (w_halting),
+    silently defeating the entire point of Graves (2016) "Adaptive Computation Time"'s
+    ponder-cost mechanism, whose Eq. 14 specifically exists to give the (otherwise
+    non-differentiable) halting step count a real gradient via the R(t) remainder term.
+    depth_counts now holds rho_t = N(t) + R(t) (float, with R(t) differentiable), so a
+    loss built from it must produce a non-zero gradient on w_halting.weight.
+    """
+    torch.manual_seed(0)
+    engine = AdaptiveCognitiveDepthEngine(hidden_dim=32, energy_threshold=0.5).cuda()
+    layers = nn.ModuleList([
+        _IdentityLayerStub() for _ in range(4)
+    ])
+
+    h_in = torch.randn(2, 5, 32, device="cuda", requires_grad=True)
+    final_h, depth_counts, _ = engine.execute_adaptive_recurrent_loop(layers, h_in, max_depth=4, min_depth=1)
+
+    assert depth_counts.dtype == h_in.dtype, "depth_counts should be a float tensor now, not int32"
+    assert depth_counts.requires_grad, "depth_counts must carry a gradient (via R(t)) back to w_halting"
+
+    loss = depth_counts.mean()
+    loss.backward()
+
+    assert engine.w_halting.weight.grad is not None, "no gradient reached w_halting.weight"
+    assert not torch.isnan(engine.w_halting.weight.grad).any()
+    assert engine.w_halting.weight.grad.abs().sum().item() > 0, "gradient to w_halting.weight is exactly zero"
+    print("Depth penalty gradient reaches w_halting.weight: "
+          f"grad abs sum = {engine.w_halting.weight.grad.abs().sum().item():.6f}")
+
+
+class _IdentityLayerStub(nn.Module):
+    """Minimal stand-in for a VeraceV1Layer: same call signature, passes h through
+    unchanged so this test isolates ACDE's own halting/ponder-cost bookkeeping from
+    the full layer stack's numerics."""
+    def forward(self, h, block_residual=None, sssd_state=None, cham_hologram=None):
+        return h, block_residual, sssd_state, cham_hologram
+
+
 if __name__ == "__main__":
     test_acd_batch_independence_and_flop_shrinkage()
+    test_acd_depth_penalty_has_gradient_to_halting_unit()

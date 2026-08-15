@@ -66,6 +66,38 @@ def test_cham_unitary_retraction_holds_under_cuda_bf16_autocast():
     assert diff < 1e-3, f"CHAM hologram is not unitary under CUDA bf16 autocast: ||H^H * H - I|| = {diff:.6f}"
     print(f"CHAM unitary constraint under CUDA bf16 autocast verified. ||H^H * H - I|| = {diff:.6f}")
 
+def test_cham_stays_finite_when_w_v_produces_large_activations():
+    """
+    Regression test for a real training-divergence root cause: v (unlike q and k) was
+    left as unnormalized F.silu(w_v(x)) output, with nothing bounding its magnitude.
+    U_t = I + i*gamma*(k v^T) is only a first-order ("infinitesimal") approximation to a
+    unitary matrix, accurate only while gamma*||k||*||v|| stays small -- verified in a
+    real pretraining run that v's max magnitude grew unboundedly (~2 -> ~17 over 50
+    steps) as w_v's weights adapted, pushing this approximation far outside its valid
+    regime and causing the holographic state to go non-finite (confirmed via forward-
+    pass tracing to be the earliest point of corruption in the whole model). Simulates
+    that scenario directly by scaling w_v's weights up by a large factor (standing in
+    for what training organically drove them to) and asserting the state stays finite
+    regardless, now that v is L2-normalized like k.
+    """
+    torch.manual_seed(0)
+    b, s, d = 2, 32, 64
+    holographic_dim = 32
+
+    cham = ContinuousHolographicMemory(hidden_dim=d, holographic_dim=holographic_dim).cuda()
+    with torch.no_grad():
+        cham.w_v.weight.mul_(50.0)  # simulate w_v's weights having grown large during training
+    x = torch.randn(b, s, d, device="cuda") * 3.0  # also scale up the input itself
+
+    output, (H_real, H_imag) = cham(x)
+    assert not torch.isnan(output).any() and not torch.isinf(output).any(), (
+        "CHAM output went non-finite for large w_v-driven activations -- v may no "
+        "longer be magnitude-bounded"
+    )
+    assert not torch.isnan(H_real).any() and not torch.isnan(H_imag).any()
+    print("CHAM stays finite when w_v produces large activations (v is magnitude-bounded).")
+
+
 def test_newton_schulz_retraction_matches_correct_complex_multiplication():
     """
     Regression test for a real bug: the retraction loop computed H_real's updated value,
