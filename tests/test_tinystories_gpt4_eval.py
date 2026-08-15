@@ -5,9 +5,9 @@ No API calls -- these test the prompt set and the grading-response parser only.
 from verace_v1.eval.tinystories_gpt4_eval import EVAL_PROMPTS, PromptResult, CompletionGrade, _parse_grade, summarize_results
 
 
-def test_eval_prompts_are_50_unique_nonempty():
-    assert len(EVAL_PROMPTS) == 50
-    assert len(set(EVAL_PROMPTS)) == 50
+def test_eval_prompts_are_44_unique_nonempty():
+    assert len(EVAL_PROMPTS) == 44
+    assert len(set(EVAL_PROMPTS)) == 44
     assert all(isinstance(p, str) and len(p.strip()) > 0 for p in EVAL_PROMPTS)
 
 

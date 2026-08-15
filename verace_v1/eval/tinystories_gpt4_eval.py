@@ -1,16 +1,20 @@
 """
 TinyStories paper's GPT-4 evaluation methodology (Eldan & Li, arXiv:2305.07759), adapted
-for Verace V1: for each of ~50 manually-constructed story-beginning prompts, generate 10
-completions at temperature=1, ask GPT-4 to grade each completion on Grammar, Creativity,
-and Consistency (0-10 each) plus a guessed writer age-group, and average the scores.
+for Verace V1: for each of the paper's 44 manually-constructed story-beginning prompts,
+generate 10 completions at temperature=1, ask GPT-4 to grade each completion on Grammar,
+Creativity, and Consistency (0-10 each) plus a guessed writer age-group, and average the
+scores.
 
-The paper does not publish its exact 50-prompt list (checked: not in the paper body or
-visible appendix), so EVAL_PROMPTS below is a representative set constructed in the same
-style/spirit -- simple, ~3-4-year-old vocabulary, room for a natural continuation -- not a
-byte-identical reproduction of their set. This means absolute scores are not directly
-comparable to the paper's table; the *methodology* (same rubric, same prompt template,
-same completions-per-prompt, same aggregation) is what's held constant for a fair-process
-comparison, matching what's actually reproducible without the paper's supplementary data.
+EVAL_PROMPTS below is the paper's actual prompt set, not an approximation: it's
+"Evaluation prompts.yaml" from the paper authors' own dataset repo
+(https://huggingface.co/datasets/roneneldan/TinyStories, file "Evaluation prompts.yaml"),
+which is not quoted or listed in the paper's PDF/appendix itself. Confirmed authentic by
+spot-checking against the paper's own worked examples: prompt #31 (0-indexed 30) is the
+"Lucy and the ladder" story completed in Figure 6, #33 is the talking-pumpkin story in
+Figure 7, and #44 is the black-cat story in Figure 8 -- all three match the paper's
+figures verbatim. This means absolute scores computed here ARE directly comparable to the
+paper's published table (Figure 4) and per-example grades (Figures 6-8), not just
+methodologically parallel.
 
 Requires OPENAI_API_KEY to actually run GPT-4 grading -- this module fails loudly if it's
 missing, rather than silently skipping grading (see run_evaluation()'s upfront check).
@@ -33,63 +37,55 @@ AGE_GROUPS = {
     "A": "3 or under", "B": "4-5", "C": "6-7", "D": "8-9", "E": "10-12", "F": "13-16",
 }
 
-# Representative TinyStories-style story-beginning prompts (see module docstring: the
-# paper's own ~50-prompt list isn't published, so this is constructed in the same style,
-# not a reproduction of theirs).
+# The paper's actual 44-prompt eval set (see module docstring for provenance/verification).
 EVAL_PROMPTS: List[str] = [
-    "Jack was hungry, so he went looking for",
-    "Lily wanted to get either a cat or a dog. Her mother didn't let her get a dog so instead she",
-    "Once upon a time there was a little girl named Lucy who loved to",
-    "The girl said to them, \"Hi, I'm Jane. What are your names?\" They said,",
-    "Tom and his sister were playing in the garden when they found a",
-    "One sunny day, a small rabbit named Ben went to the park to",
-    "Once there was a boy named Max. Max loved his red ball more than anything. One day, the ball",
-    "Anna was sad because she lost her favorite toy. She looked everywhere until she",
-    "The old dog Rex was sleeping under the tree when suddenly he heard a",
-    "Mia and her best friend Sam wanted to build a sandcastle at the beach, so they",
-    "It was a cold winter morning. Sara put on her warm coat and went outside to",
-    "Ben found a shiny key on the ground. He wondered what it could",
-    "The little bird could not fly yet. Every day, its mother taught it to",
-    "Grandma was baking cookies in the kitchen. The smell made everyone",
-    "Two friends, Leo and Mia, decided to explore the old forest behind their house. They",
-    "The kitten was stuck in a tall tree and could not get down. A boy named Sam",
-    "Every morning, the farmer fed his animals. Today, the little pig ran away, so the farmer",
-    "Emma got a new bicycle for her birthday. She was so excited that she",
-    "There was a small boat on the lake. Two children, Amy and Jack, wanted to",
-    "The wind blew hard and knocked over all the flower pots. Mom asked Tim to",
-    "A little mouse lived in a hole in the wall. One day, it found a piece of",
-    "Sophie loved to draw pictures of animals. Today she wanted to draw a",
-    "The children were playing hide and seek in the yard. It was Ollie's turn to",
-    "It began to rain suddenly during the picnic. Everyone ran to",
-    "The puppy chewed on Dad's shoe and made a big mess. Dad was",
-    "In the middle of the night, Lily heard a strange noise outside her window. She",
-    "The three friends built a treehouse together over the summer. Inside, they kept",
-    "A butterfly landed on Ella's hand while she was sitting in the garden. She",
-    "Jake dropped his ice cream on the ground and started to cry. His big brother",
-    "The old clock in the hallway stopped working. Grandpa tried to",
-    "Zoe wanted to help her mom cook dinner, so she",
-    "The little duckling got separated from its family at the pond. A kind girl named Ruby",
-    "On the first day of school, Noah was very nervous. His teacher smiled and said,",
-    "The two brothers found an old chest buried in the backyard. Inside, there was",
-    "Every night before bed, Daddy read Mia a story about a",
-    "The snow fell all night, and in the morning the whole town was covered in white. The children",
-    "A little fish named Finn wanted to see what was beyond the coral reef, so he",
-    "Mom told Tom not to touch the hot stove, but he was curious, so he",
-    "The class went on a trip to the zoo. Everyone's favorite animal was the",
-    "Lucas built a tower out of blocks, but his little sister knocked it down. He felt",
-    "The stray cat outside the house looked hungry and cold. Emily decided to",
-    "It was the last day of summer, and the friends wanted to do something special. They",
-    "A strong wind carried Sam's kite far into the sky. He chased after it and",
-    "The garden was full of colorful flowers. Grandma taught Lily how to",
-    "One night, a little star fell from the sky into the backyard. The children found it and",
-    "Ben's dog ran into the woods and did not come back. Ben and his dad went to",
-    "The two sisters wanted to make a lemonade stand. First, they",
-    "A loud thunder scared the little rabbit, and it hid under the",
-    "Every summer, the family went camping by the lake. This year, they brought a new",
-    "The little boy could not find his teddy bear anywhere. He asked his mom, and she",
+    "Once upon a time, there lived a bunny in a field. Her name was Lucy. Lucy loved to have feasts and parties with her bunny friends. One day, when Lucy was about to leave for a feast at a friend's house, she realized she's starting to feel sick. She was so weak she could",
+    "One day a girl walked into the living room and noticed something very strange. There was a huge cabinet standing in the corner. It looked very old and heavy. She walked over and tried to open it, when suddenly",
+    "Once upon a time, there lived a hamster in the forest. Every day, he would walked around the forest and looking for adventures. One day, he heard someone calling out from behind the bushes.\n\nThe hamster listened carefully. He realised that it was a small mouse calling out for help. It got stuck under a heavy log and couldn't get out. The hamster immediately realized that",
+    "Jack asked his mom if he could ride the bike all the way to his grandmother's house. She agreed, but she said that he shouldn't ride too fast because it was raining and the path was wet.\n\nHe started riding and realized he was hungry, so he decided that he should get to his grandmother's house as fast as possible. But then he remembered his mum's words \"",
+    "Alice was bored and wanted to find some adventures. She walked up to her friend Ben, who looked vey busy playing with his toys. Alice said, \"Why don't we",
+    "Alice walked up to her friend Ben's house. She was planning to ask him to go to the park with her. When Ben opened the door, she asked him if he had any plans. He said, \"I'm sorry, Alice, but",
+    "The day before Ben's birthday, Alice walked into the kitchen and saw Ben sitting there, looking Gloomy. She said, \"Ben, why are you",
+    "Alice walked into the kitchen and saw Ben who was looking for something but looked frustrated. She said, \"Ben, why are you",
+    "Once upon a time there was a curious boy who lived in a house with a big garden. Every day he explored the garden he found new surprises. But one day, it was raining so hard that his mother told him",
+    "Once upon a time, there was tiger who liked to play the guitar. One day, a bunny heard the guitar from a distance and",
+    "Alice wanted to play with her doll, but she couldn't remember where she had put it. She looked all around the house but couldn't find it, so she decided",
+    "\"Ben, what do you have in your pocket?\", Alice asked. \"Oh, nothing.\", Ben replied. But Alice saw that there was definitely something in Ben's pocket, and she was very curious what it was, so she",
+    "One day, a bird was flying high over the sea. At some point the bird noticed small boat with a boy sitting inside. The boy looked lost so",
+    "Jimmy was on his way to school with his father when he noticed a tree with strange looking fruits on it. He asked his father, \"Can I try",
+    "Once upon a time, there lived two best friends called Jack and Joe. They were bored, they wanted someone else to talk to or play with. Jack had an idea. He said to Joe, “Let’s go and find",
+    "Jack and Sally were running through the woods together when they stopped suddenly. They heard a strange sound coming from around the corner.\n\n“What's that?” asked Jack.\n\nSally put her finger to her lips and said, “Shhhh. Let's go find out.”\n\nJack and Sally followed the",
+    "Once upon a time there was a little bear named Diva. She was hungry, and wanted to bake a cake, but she didn't have any sugar at home, so she decided to go ask around. She started walking and met a squirrel. She asked the squirrel, \"Would you happen",
+    "Anna was a popular girl, who walked to school every day carrying a very heavy backpack. It was so heavy that she could hardly walk.\n\nOne day, Anna's friends asked her why her backpack was so heavy. She said that",
+    "Once there was a young girl named Anna. She was three years old and usually very happy. Today she was sad because she couldn't play in the park. She had asked her parents to take her but they wouldn't listen. Anna insisted that ",
+    "One day, Grandma was in the kitchen getting ready to prepare. She had the ingredients for a tasty dish.\n\nGrandma said to her granddaughter, \"Are you going to help me make this meal?\" Her granddaughter, Jenny, replied, \"Yes, I will help you!\"\n\nGrandma and Jenny began to prepare the ingredients. Jenny was clumsy. She dropped",
+    "Once upon a time there was a boy named Max. He was at the market with his mother, where he saw two things he wanted very much: a toy car and a jumping rope.\n\nHe knew that his mother would not let him buy both of these things, and that she would probably tell him that he has to choose one. He said to her, \"I want both",
+    "Once upon a time there was a small brown mouse who lived in a big tree. The mouse wanted to be better friends with the birds that flew around the tree, but they were always too afraid to let him get close. \n\nOne day, the mouse spoke to the birds bravely, \"Please don't be",
+    "Once upon a time there was a mummy, a daddy and a little girl. The family lived in a house and the little girl liked to play in the living room. Her favourite spot was a big, comfy armchair. \n\nOne day, the little girl was playing in the armchair when mummy and daddy said it was time to go. She didn't want to leave, she wanted to stay in her",
+    "Jack was a chubby little boy. He liked to pick flowers in the garden. One day, he went out to the garden to pick some flowers but his Mom said he had to take his medicine first. He didn't like the medicine's taste.\n\n\"Do I have to take it?\" Jack asked.\n\nHis Mom nodded. \"Yes,",
+    "Once upon a time, there lived a small dog named Spike. He was an adventurous pup who loved to explore the world. One day, while he was wandering around, he stumbled upon a big tree. He saw something shining at the top. He wanted to climb it to see what it was.\n\nSpike placed his paws on the trunk and started to climb, but the trunk was too",
+    "Once there was a mother and daughter walking in the park. They noticed a bird perched on a branch, singing its song. The daughter shouted with delight, “Look Mommy! A bird!”\n\nThe mother smiled and said, “Yes! See how colorful it is?”\n\nThe daughter then asked, “Can I share my snack with it?”\n\nThe mother replied, “No, sweetie. That's a bad idea because",
+    "Once upon a time there were two friends, Max and Alex. One day Max invited Alex to his house for lunch. Alex was excited to accept, and so they went.\n\nWhen they arrived, Max told Alex that he had made soup for lunch. Alex was excited and thanked Max for his kind invitation. Max smiled and said it was easy to make.\n\nLater, it was time to eat the soup. Max took the first spoonful and tasted it. He realized something must be wrong with the soup, because it tasted very weird. He said to Alex, \"This soup",
+    "Once upon a time there was a little girl called Emma. She was only three years old. One day, her aunt said to her, “Emma, would you like to go out with me to pick up some flowers?”\n\nEmma was very excited. She said,",
+    "Once upon a time there was a little girl named Lucy. She loved to explore the world around her, especially when it was bright and sunny outside. \n\nOne day, while exploring the nearby park, Lucy came across an old and long rock wall. She was curious and wanted to get to the top, so she began to look around for something she could use to climb it. Suddenly, she spotted a",
+    "Once upon a time there was a small girl named Lucy. She was only three years old and was very adventurous. She loved to explore the world around her, especially when it was bright and sunny outside. \n\nOne day, while exploring the nearby park, Lucy came across a ladder leaning on a wall. She was curious to see what's on top, so she climbed the ladder, but when she reached the top, the ladder fell and she was stuck.\n\nA nearby park ranger noticed her and shouted out, \"",
+    "Once upon a time, in a far away land, two best friends, Bob and Jill, were playing hide and seek. Jill hid below a large wooden table. She was very quiet so that",
+    "Once upon a time there was a pumpkin. It was a very special pumpkin, it could speak. It was sad because it couldn't move. Every day, it would say",
+    "Once upon a time there were two friends, Sally and Joe who liked to go to each other's house. One day, Joe wanted to visit Sally so he walked up to her house. He knocked on the door, but",
+    "Mum was getting ready for bed, so she told her son, \"It's time for a bath\". He nodded and ran off to the bathroom. He watched as Mum turned on the bathtub, the water pouring out of the tap and filling the tub.\n\nMum asked, \"What do you want in your bath?\" He thought for a moment and said",
+    "Once upon a time, there was a jolly boy named Dan. He was a youth of three years old. He liked to play outside in the bright sunshine.\n\nOne day, Dan was playing in his garden when he saw something very exciting.\n\n“Look, Mama!” shouted Dan, “I see something moving!”\n\nMama peered around the corner to see what Dan was pointing at. It was a",
+    "Once upon a time there was a little boy named Tom. Tom loved playing outside, but he always had to be careful not to make too much noise.\n\nOne day, Tom went out to explore the garden. Soon he found an unusual fruit. It looked like a prune! Tom picked up the prune and looked at it closely. It smelled sweet.\n\nTom wanted to find out how the prune tasted, so he",
+    "Once there were two friends who were walking together in the park. One had a cane and the other didn't. The one without the cane wanted to borrow the cane from the other. But the other friend said",
+    "One day, Timmy had a goal. He wanted to fit into his favorite toy car. He was very excited, but grumpy too. He tried to fit into the car but he was",
+    "Once upon a time, there was a little girl. Her name was Julia. Every day, Julia helped her mama do the laundry. It was her favourite job. She loved to put the",
+    "It was a sunny day and Ben wanted to go outside and play. He grabbed his toy car and ran to the garden. Suddenly, something pinched his hand!\n\nBen looked around but there was nothing there. He was scared so he held onto the hoop tightly.\n\nThen he heard a voice. \"Don't be scared, little one. It's just me!\"\n\nBen looked up and saw a big, scary spider. He was scared!\n\nThe spider smiled. \"Don't be scared, I just wanted to",
+    "Once upon a time there was a little girl. She liked to go out and explore the world. One day she decided to go for a walk in the forest.\n\nAs she was walking, she spotted a mysterious house. She stepped closer to get a better look. Suddenly, a witch appeared from the door, and the little girl was very scared. \n\n\"What do you want?\" asked the witch.\n\nThe little girl was brave and said, \"I want to explore this house and see",
+    "Once there was a boy named Sam. He was three years old and very naughty. One day, his mom told him not to touch her phone but Sam did not listen. He picked up the phone and started playing with it.\n\nMom saw him and said, \"be careful not to",
+    "Once upon a time, there lived a black cat. The cat belonged to a little girl called Katie. Every day, Katie would take her cat for a walk in the park. \n\nOne day, as Katie and her cat were walking around, they saw a mean looking man. He said he wanted to take the cat, to which she replied \"This cat belongs",
+    "Once upon a time, there was a little boy who was always naughty. His mom was always telling him to be good, but he kept disobeying her rules and ignoring her warnings. \n\nOne day, he was so naughty that his mom decided to punish him. She told him that he had to",
 ]
 
-assert len(EVAL_PROMPTS) == 50, f"expected 50 prompts, got {len(EVAL_PROMPTS)}"
+assert len(EVAL_PROMPTS) == 44, f"expected 44 prompts, got {len(EVAL_PROMPTS)}"
 
 _GRADING_PROMPT_TEMPLATE = """The following exercise, the student is given a beginning of a story. The student needs to complete it into a full story. The exercise tests the student's language abilities and creativity. The symbol *** marks the separator between the prescribed beginning and the student's completion:
 
