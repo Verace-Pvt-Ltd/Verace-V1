@@ -211,6 +211,7 @@ if HAS_TRITON:
         P_i = tl.zeros((BLOCK_H, BLOCK_H), dtype=tl.float32)
 
         NS_STEPS: tl.constexpr = 3
+        CAYLEY_EPS: tl.constexpr = 1e-7
         # Hraw_r/Hraw_i: this chunk's local raw P combined with H_0 (Total_t = P_t @ H_0),
         # BEFORE retraction -- this, not the purely-local P_r/P_i and not the retracted
         # Hro_r/Hro_i, is what must be exported as the continuable state (see module
@@ -235,9 +236,8 @@ if HAS_TRITON:
             # NaN training divergence at holographic_dim >= 48 -- see git history).
             # Derivation/validation: see cham_memory.py's module docstring.
             kv = tl.sum(k * v)
-            eps: tl.constexpr = 1e-7
-            is_active = tl.where(tl.abs(g) < eps, 0.0, 1.0)
-            g_safe = tl.where(tl.abs(g) < eps, eps, g)
+            is_active = tl.where(tl.abs(g) < CAYLEY_EPS, 0.0, 1.0)
+            g_safe = tl.where(tl.abs(g) < CAYLEY_EPS, CAYLEY_EPS, g)
 
             b_r = -kv
             b_i = -2.0 / g_safe
