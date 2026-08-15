@@ -152,18 +152,20 @@ class ContinuousHolographicMemory(nn.Module):
                 active_mask = active_mask.unsqueeze(-1)
             gamma = gamma * active_mask.to(gamma.dtype)
 
-        # NOTE: the Triton fast path (launch_cham_triton_update / launch_cham_triton_tiled
-        # in verace_v1/serving/triton_kernels.py) is intentionally NOT called here. Both
-        # implement the same first-order-only approximate update U_t = I + i*gamma*(k v^T)
-        # that this module's O(log S) path below replaced with an exact Cayley-transform
-        # construction (see git history / verace_v1/modules/cham_memory.py's forward()
-        # comments below) after it was found to cause unbounded, sequence-length-compounding
-        # drift from unitarity -- confirmed as the root cause of NaN training divergence at
-        # chams_holographic_dim >= 48. Porting the exact fix into Triton requires either a
-        # batched complex linear solve or a hand-derived low-rank (Woodbury) closed form,
-        # neither implemented/verified yet; until one is, correctness (this path) is
-        # strictly preferred over the Triton path's speed. Do not re-enable the Triton path
-        # for CHAM without applying the same exact-unitary fix to it first.
+        # GPU Triton Path (Inference fast path). Both launch_cham_triton_update (h_dim <=
+        # 128, cham_holographic_scan_kernel) and its h_dim > 128 fallback
+        # launch_cham_triton_tiled (_cham_rank2_update_kernel) implement the same exact
+        # Cayley-transform unitary update as the O(log S) path below (see either kernel's
+        # docstring in verace_v1/serving/triton_kernels.py for the Sherman-Morrison-
+        # Woodbury derivation) -- previously they implemented only a first-order
+        # approximation, which caused unbounded, sequence-length-compounding drift from
+        # unitarity (root cause of NaN training divergence at chams_holographic_dim >= 48);
+        # both were fixed to match this path exactly (see git history).
+        if x.is_cuda and HAS_TRITON and not x.requires_grad:
+            from verace_v1.serving.triton_kernels import launch_cham_triton_update
+            hologram_out, (H_real, H_imag) = launch_cham_triton_update(q, k, v, gamma.squeeze(-1), initial_hologram)
+            y = self.norm(self.w_out(hologram_out))
+            return y, (H_real, H_imag)
 
         # O(log S) Associative Parallel Prefix Scan Path
         # Forced to fp32 with autocast disabled: this path's entire purpose is an exact

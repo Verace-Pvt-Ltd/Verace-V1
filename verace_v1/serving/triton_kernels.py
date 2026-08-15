@@ -175,10 +175,17 @@ if HAS_TRITON:
         actually carried across steps AND exported as the final state for a caller to
         continue from; H_0 is composed in and NS-retracted fresh at every position for the
         readout only, and next step's rank-1 update is applied to the raw P, not to the
-        retracted readout.
+        retracted readout, and next step's rank-2 update is applied to the raw P, not to
+        the retracted readout.
 
-        U_t = I + i*gamma_t*(k_t v_t^T); k_t v_t^T is rank-1, so U_t @ P is applied in
-        O(h_dim^2) without a dense matmul: (k v^T) @ P = k (v^T P). P @ H_0 and the
+        U_t = I + W N W^T (W=[k_t,v_t], N a 2x2 complex matrix computed per-token from
+        k_t.v_t and gamma_t via Sherman-Morrison-Woodbury) is the EXACT Cayley transform
+        of the Hermitian generator G_t = gamma_t*(k_t v_t^T + v_t k_t^T) -- see this
+        function's per-token comment below, and cham_memory.py's forward()/module
+        docstring, for the derivation and why exactness (not just a first-order
+        approximation) matters. Since W has rank <= 2, U_t @ P is applied in O(h_dim^2)
+        without a dense h_dim x h_dim matmul: W N W^T @ P reduces to two rank-1 outer-
+        product updates driven by the reductions k^T P and v^T P. P @ H_0 and the
         Newton-Schulz retraction matmuls are genuine dense products (tl.dot).
         """
         pid_b = tl.program_id(0)
@@ -218,11 +225,53 @@ if HAS_TRITON:
             v = tl.load(v_ptr + t_off + offs, mask=mask_d, other=0.0).to(tl.float32)
             g = tl.load(gamma_ptr + pid_b * seq_len + t).to(tl.float32)
 
-            # Raw prefix update: P <- U_t @ P = P + i*g*k*(v^T P). Never retracted.
-            vT_Pi = tl.sum(v[:, None] * P_i, axis=0)
+            # Raw prefix update: P <- U_t @ P. Never retracted.
+            # U_t = I + W N W^T (W=[k,v]) is the EXACT Cayley transform of the Hermitian
+            # generator G_t = g*(k v^T + v k^T), via Sherman-Morrison-Woodbury (only 2x2
+            # complex arithmetic -- no dense d x d solve needed, since G_t is rank <= 2).
+            # Matches verace_v1/modules/cham_memory.py's forward() exactly; replaces the
+            # old first-order-only approximation U_t = I + i*g*(k v^T), whose deviation
+            # from unitarity compounded unboundedly across the sequence (root cause of
+            # NaN training divergence at holographic_dim >= 48 -- see git history).
+            # Derivation/validation: see cham_memory.py's module docstring.
+            kv = tl.sum(k * v)
+            eps: tl.constexpr = 1e-7
+            is_active = tl.where(tl.abs(g) < eps, 0.0, 1.0)
+            g_safe = tl.where(tl.abs(g) < eps, eps, g)
+
+            b_r = -kv
+            b_i = -2.0 / g_safe
+            denom_r = 1.0 - b_r * b_r + b_i * b_i
+            denom_i = -2.0 * b_r * b_i
+            dmag2 = denom_r * denom_r + denom_i * denom_i
+            inv_r = denom_r / dmag2
+            inv_i = -denom_i / dmag2
+            M11_r = -inv_r
+            M11_i = -inv_i
+            M12_r = -b_r * inv_r + b_i * inv_i
+            M12_i = -(b_r * inv_i + b_i * inv_r)
+            mp_diag_r = M11_r + kv * M12_r
+            mp_diag_i = M11_i + kv * M12_i
+            mp_off_r = kv * M11_r + M12_r
+            mp_off_i = kv * M11_i + M12_i
+            N11_r = (M11_r - (g_safe / 2.0) * mp_off_i) * is_active
+            N11_i = (M11_i + (g_safe / 2.0) * mp_off_r) * is_active
+            N12_r = (M12_r - (g_safe / 2.0) * mp_diag_i) * is_active
+            N12_i = (M12_i + (g_safe / 2.0) * (1.0 + mp_diag_r)) * is_active
+            # N21 = N12, N22 = N11 (symmetric, since G_t is symmetric in k, v)
+
+            kT_Pr = tl.sum(k[:, None] * P_r, axis=0)
+            kT_Pi = tl.sum(k[:, None] * P_i, axis=0)
             vT_Pr = tl.sum(v[:, None] * P_r, axis=0)
-            P_r = P_r - g * (k[:, None] * vT_Pi[None, :])
-            P_i = P_i + g * (k[:, None] * vT_Pr[None, :])
+            vT_Pi = tl.sum(v[:, None] * P_i, axis=0)
+
+            C_r = N11_r * kT_Pr - N11_i * kT_Pi + N12_r * vT_Pr - N12_i * vT_Pi
+            C_i = N11_r * kT_Pi + N11_i * kT_Pr + N12_r * vT_Pi + N12_i * vT_Pr
+            D_r = N12_r * kT_Pr - N12_i * kT_Pi + N11_r * vT_Pr - N11_i * vT_Pi
+            D_i = N12_r * kT_Pi + N12_i * kT_Pr + N11_r * vT_Pi + N11_i * vT_Pr
+
+            P_r = P_r + k[:, None] * C_r[None, :] + v[:, None] * D_r[None, :]
+            P_i = P_i + k[:, None] * C_i[None, :] + v[:, None] * D_i[None, :]
 
             # Combined raw readout: Total_t = P_t @ H_0 (H_0 on the right -- see docstring).
             Hraw_r = tl.dot(P_r, H0_r, allow_tf32=False) - tl.dot(P_i, H0_i, allow_tf32=False)
@@ -351,17 +400,23 @@ if HAS_TRITON:
         tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=c_mask)
 
     @triton.jit
-    def _cham_rank1_update_kernel(
-        hr_ptr, hi_ptr, k_ptr, vth_r_ptr, vth_i_ptr, g_ptr,
+    def _cham_rank2_update_kernel(
+        hr_ptr, hi_ptr, k_ptr, v_ptr,
+        kth_r_ptr, kth_i_ptr, vth_r_ptr, vth_i_ptr,
+        n11_r_ptr, n11_i_ptr, n12_r_ptr, n12_i_ptr,
         d,
         stride_hr_m, stride_hr_n, stride_hi_m, stride_hi_n,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
     ):
-        """In-place H_r -= g*(k (v^T H_i)), H_i += g*(k (v^T H_r)) over a (row,col) tile
-        grid -- the rank-1 structure means this needs no K-loop/reduction, only the
-        already-reduced v^T H_r / v^T H_i vectors (computed by a separate tiled matmul
-        call with M=1, since k v^T is exactly rank 1: see write-up in the module docstring
-        of cham_holographic_scan_kernel)."""
+        """In-place H += k(C) + v(D) over a (row,col) tile grid, where C = N11*(k^T H) +
+        N12*(v^T H), D = N12*(k^T H) + N11*(v^T H) (all complex; N21=N12, N22=N11 since
+        the generator is symmetric in k,v) -- the exact rank-2 Cayley-transform update,
+        matching cham_holographic_scan_kernel's per-token comment (same math, same
+        derivation) but with N11/N12 precomputed host-side in _cham_tiled_step (cheap
+        2x2 scalar arithmetic, not worth a separate kernel launch) and passed in as
+        single-element tensors. Needs no K-loop/reduction here, only the already-reduced
+        k^T H / v^T H vectors (computed by separate tiled matmul calls with M=1, since
+        the correction is rank <= 2)."""
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -371,17 +426,28 @@ if HAS_TRITON:
         mask = mask_m[:, None] & mask_n[None, :]
 
         k_tile = tl.load(k_ptr + offs_m, mask=mask_m, other=0.0)
-        vthr_tile = tl.load(vth_r_ptr + offs_n, mask=mask_n, other=0.0)
-        vthi_tile = tl.load(vth_i_ptr + offs_n, mask=mask_n, other=0.0)
-        g = tl.load(g_ptr)
+        v_tile = tl.load(v_ptr + offs_m, mask=mask_m, other=0.0)
+        kthr = tl.load(kth_r_ptr + offs_n, mask=mask_n, other=0.0)
+        kthi = tl.load(kth_i_ptr + offs_n, mask=mask_n, other=0.0)
+        vthr = tl.load(vth_r_ptr + offs_n, mask=mask_n, other=0.0)
+        vthi = tl.load(vth_i_ptr + offs_n, mask=mask_n, other=0.0)
+        n11_r = tl.load(n11_r_ptr)
+        n11_i = tl.load(n11_i_ptr)
+        n12_r = tl.load(n12_r_ptr)
+        n12_i = tl.load(n12_i_ptr)
+
+        c_r = n11_r * kthr - n11_i * kthi + n12_r * vthr - n12_i * vthi
+        c_i = n11_r * kthi + n11_i * kthr + n12_r * vthi + n12_i * vthr
+        d_r = n12_r * kthr - n12_i * kthi + n11_r * vthr - n11_i * vthi
+        d_i = n12_r * kthi + n12_i * kthr + n11_r * vthi + n11_i * vthr
 
         hr_ptrs = hr_ptr + offs_m[:, None] * stride_hr_m + offs_n[None, :] * stride_hr_n
         hi_ptrs = hi_ptr + offs_m[:, None] * stride_hi_m + offs_n[None, :] * stride_hi_n
         hr = tl.load(hr_ptrs, mask=mask, other=0.0)
         hi = tl.load(hi_ptrs, mask=mask, other=0.0)
 
-        hr_new = hr - g * (k_tile[:, None] * vthi_tile[None, :])
-        hi_new = hi + g * (k_tile[:, None] * vthr_tile[None, :])
+        hr_new = hr + k_tile[:, None] * c_r[None, :] + v_tile[:, None] * d_r[None, :]
+        hi_new = hi + k_tile[:, None] * c_i[None, :] + v_tile[:, None] * d_i[None, :]
 
         tl.store(hr_ptrs, hr_new, mask=mask)
         tl.store(hi_ptrs, hi_new, mask=mask)
@@ -412,22 +478,52 @@ def _cham_tiled_step(
     Pr: torch.Tensor, Pi: torch.Tensor, H0r: torch.Tensor, H0i: torch.Tensor,
     k: torch.Tensor, v: torch.Tensor, q: torch.Tensor, g: torch.Tensor, d: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One step: raw rank-1 prefix update (never retracted, carried forward as Pr/Pi),
-    then a fresh combined-raw readout Hraw = P @ H0 (H0 on the RIGHT -- see
-    cham_holographic_scan_kernel's docstring for why: new tokens' rotations left-multiply
-    onto the running product, so H0 must be composed in after this chunk's own P, not
-    before it), retracted via 3x Newton-Schulz into a SEPARATE copy for this step's output.
-    Returns (Pr, Pi, Hraw_r, Hraw_i, rec); Hraw_r/Hraw_i (the combined raw value, BEFORE
-    retraction) -- not the purely-local Pr/Pi and not the retracted output -- is what the
-    caller exports as the final continuable state if this is the last timestep."""
-    v_row = v.view(1, d)
+    """One step: raw EXACT rank-2 Cayley-transform prefix update (never retracted, carried
+    forward as Pr/Pi -- see _cham_rank2_update_kernel and cham_holographic_scan_kernel's
+    docstring for the math), then a fresh combined-raw readout Hraw = P @ H0 (H0 on the
+    RIGHT -- see cham_holographic_scan_kernel's docstring for why: new tokens' rotations
+    left-multiply onto the running product, so H0 must be composed in after this chunk's
+    own P, not before it), retracted via 3x Newton-Schulz into a SEPARATE copy for this
+    step's output. Returns (Pr, Pi, Hraw_r, Hraw_i, rec); Hraw_r/Hraw_i (the combined raw
+    value, BEFORE retraction) -- not the purely-local Pr/Pi and not the retracted output
+    -- is what the caller exports as the final continuable state if this is the last
+    timestep."""
+    # N11, N12 (2x2 Cayley-transform coefficients, symmetric: N21=N12, N22=N11) computed
+    # host-side -- cheap scalar arithmetic, not worth a separate kernel launch. See
+    # cham_holographic_scan_kernel's per-token comment for the derivation; validated to
+    # match a direct d x d complex solve to machine precision.
+    kv = torch.dot(k, v)
+    eps = 1e-7
+    is_active = torch.where(g.abs() < eps, torch.zeros_like(g), torch.ones_like(g))
+    g_safe = torch.where(g.abs() < eps, torch.full_like(g, eps), g)
+
+    b_r, b_i = -kv, -2.0 / g_safe
+    denom_r = 1.0 - b_r * b_r + b_i * b_i
+    denom_i = -2.0 * b_r * b_i
+    dmag2 = denom_r * denom_r + denom_i * denom_i
+    inv_r, inv_i = denom_r / dmag2, -denom_i / dmag2
+    m11_r, m11_i = -inv_r, -inv_i
+    m12_r = -b_r * inv_r + b_i * inv_i
+    m12_i = -(b_r * inv_i + b_i * inv_r)
+    mp_diag_r, mp_diag_i = m11_r + kv * m12_r, m11_i + kv * m12_i
+    mp_off_r, mp_off_i = kv * m11_r + m12_r, kv * m11_i + m12_i
+    n11_r = (m11_r - (g_safe / 2.0) * mp_off_i) * is_active
+    n11_i = (m11_i + (g_safe / 2.0) * mp_off_r) * is_active
+    n12_r = (m12_r - (g_safe / 2.0) * mp_diag_i) * is_active
+    n12_i = (m12_i + (g_safe / 2.0) * (1.0 + mp_diag_r)) * is_active
+
+    k_row, v_row = k.view(1, d), v.view(1, d)
+    kT_Pr = _tiled_matmul(k_row, Pr).view(d)
+    kT_Pi = _tiled_matmul(k_row, Pi).view(d)
     vT_Pr = _tiled_matmul(v_row, Pr).view(d)
     vT_Pi = _tiled_matmul(v_row, Pi).view(d)
 
     BLOCK = min(64, max(16, triton.next_power_of_2(d)))
     grid = (triton.cdiv(d, BLOCK), triton.cdiv(d, BLOCK))
-    _cham_rank1_update_kernel[grid](
-        Pr, Pi, k, vT_Pr, vT_Pi, g.reshape(1),
+    _cham_rank2_update_kernel[grid](
+        Pr, Pi, k, v,
+        kT_Pr, kT_Pi, vT_Pr, vT_Pi,
+        n11_r.reshape(1), n11_i.reshape(1), n12_r.reshape(1), n12_i.reshape(1),
         d,
         Pr.stride(0), Pr.stride(1), Pi.stride(0), Pi.stride(1),
         BLOCK_M=BLOCK, BLOCK_N=BLOCK
