@@ -93,6 +93,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--head_dim", type=int, default=64)
     p.add_argument("--spectral_dim", type=int, default=64)
     p.add_argument("--chams_holographic_dim", type=int, default=64)
+    p.add_argument("--vision_embed_dim", type=int, default=128,
+                    help="PilotVisionConfig.embed_dim -- the vision encoder is always "
+                         "instantiated (see backbone.py) even for text-only runs, so its "
+                         "size still counts toward total param count. Shrink this (e.g. to "
+                         "16) when targeting an exact total-param budget, such as matching "
+                         "the TinyStories paper's (arXiv:2305.07759) published model sizes.")
+    p.add_argument("--vision_layers", type=int, default=2, help="PilotVisionConfig.num_layers.")
+    p.add_argument("--vision_heads", type=int, default=2, help="PilotVisionConfig.num_heads.")
     p.add_argument("--mcmoe_rank", type=int, default=16)
     p.add_argument("--mcmoe_num_components", type=int, default=16)
     p.add_argument("--max_cognitive_depth", type=int, default=6)
@@ -176,7 +184,11 @@ def main():
         mcmoe_num_components=args.mcmoe_num_components,
         max_cognitive_depth=args.max_cognitive_depth,
         min_cognitive_depth=args.min_cognitive_depth,
-        vision_config=PilotVisionConfig(),
+        vision_config=PilotVisionConfig(
+            embed_dim=args.vision_embed_dim,
+            num_layers=args.vision_layers,
+            num_heads=args.vision_heads,
+        ),
     )
 
     if args.tokenizer == "gpt_neo_top10k":
