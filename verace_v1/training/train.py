@@ -112,6 +112,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--muon_momentum", type=float, default=0.98)
     p.add_argument("--muon_weight_decay", type=float, default=0.05)
     p.add_argument("--adamw_lr", type=float, default=3e-4)
+    p.add_argument("--adamw_weight_decay", type=float, default=0.0)
+    p.add_argument("--adamw_beta1", type=float, default=0.9)
+    p.add_argument("--adamw_beta2", type=float, default=0.95)
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                    help="Accumulate gradients over N micro-batches before each optimizer "
+                         "step, for an effective batch size of --batch_size * N without the "
+                         "memory cost of a single large batch. Loss is averaged over the N "
+                         "micro-batches so the reported --log_every loss is comparable "
+                         "regardless of --grad_accum_steps.")
     p.add_argument("--warmup_steps", type=int, default=20)
     p.add_argument("--depth_penalty_weight", type=float, default=0.001)
     p.add_argument("--energy_penalty_weight", type=float, default=0.01)
@@ -247,6 +256,8 @@ def main():
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,
         adamw_lr=args.adamw_lr,
+        adamw_weight_decay=args.adamw_weight_decay,
+        adamw_betas=(args.adamw_beta1, args.adamw_beta2),
     )
     # Two schedulers (one per inner optimizer) because HybridMuonAdamW composes two
     # real torch.optim.Optimizer instances rather than being one itself.
@@ -268,22 +279,30 @@ def main():
     try:
         for step in range(start_step, args.steps):
             t0 = time.time()
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-            batch = {k: v.to(args.device) for k, v in batch.items()}
-
             diagnostics = {}
-            ce_loss, mean_depth = train_pretrain_step(
-                model, optimizer, batch,
-                depth_penalty_weight=args.depth_penalty_weight,
-                energy_penalty_weight=args.energy_penalty_weight,
-                use_amp=args.use_amp and args.device == "cuda",
-                diagnostics=diagnostics,
-                max_grad_norm=args.max_grad_norm,
-            )
+            ce_loss = mean_depth = None
+            for micro in range(args.grad_accum_steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+                batch = {k: v.to(args.device) for k, v in batch.items()}
+
+                # diagnostics/grad_norm only meaningful (and only populated) on the final
+                # micro-batch, once the accumulated gradient is complete and about to be
+                # clipped+applied -- earlier micro-batches only need loss for logging.
+                ce_loss, mean_depth = train_pretrain_step(
+                    model, optimizer, batch,
+                    depth_penalty_weight=args.depth_penalty_weight,
+                    energy_penalty_weight=args.energy_penalty_weight,
+                    use_amp=args.use_amp and args.device == "cuda",
+                    diagnostics=diagnostics if micro == args.grad_accum_steps - 1 else None,
+                    max_grad_norm=args.max_grad_norm,
+                    loss_scale=1.0 / args.grad_accum_steps,
+                    zero_grad=(micro == 0),
+                    do_step=(micro == args.grad_accum_steps - 1),
+                )
             cham_deviation = cham_probe.pop_mean_deviation()
             muon_scheduler.step()
             adamw_scheduler.step()

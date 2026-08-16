@@ -116,7 +116,10 @@ def train_pretrain_step(
     energy_penalty_weight: float = 0.01,
     use_amp: bool = True,
     diagnostics: Optional[Dict] = None,
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0,
+    loss_scale: float = 1.0,
+    zero_grad: bool = True,
+    do_step: bool = True,
 ) -> Tuple[float, float]:
     """
     Production pre-training step minimizing:
@@ -139,9 +142,17 @@ def train_pretrain_step(
     depth_distribution_stats(depth_counts) (see verace_v1/training/diagnostics.py) and
     grad_norm (pre-clip global gradient norm) -- purely additive, existing callers that
     don't pass it see no change.
+
+    Gradient accumulation: pass `loss_scale=1/N`, `zero_grad=(micro_step==0)`,
+    `do_step=(micro_step==N-1)` across N consecutive calls sharing one accumulation
+    window to get an effective batch N times larger without holding N micro-batches'
+    activations at once. Defaults (loss_scale=1.0, zero_grad=True, do_step=True) match
+    the original single-micro-batch-per-step behavior exactly, so existing callers are
+    unaffected.
     """
     model.train()
-    optimizer.zero_grad()
+    if zero_grad:
+        optimizer.zero_grad()
 
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -179,11 +190,12 @@ def train_pretrain_step(
     if diagnostics is not None:
         diagnostics.update(depth_distribution_stats(depth_counts))
 
-    total_loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    if diagnostics is not None:
-        diagnostics["grad_norm"] = grad_norm.item()
-    optimizer.step()
+    (total_loss * loss_scale).backward()
+    if do_step:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        if diagnostics is not None:
+            diagnostics["grad_norm"] = grad_norm.item()
+        optimizer.step()
 
     return ce_loss.item(), torch.mean(depth_counts.float()).item()
 
